@@ -36,6 +36,7 @@ At the top of **Patches**, **Preset** sets everything at once:
 | Hide sidebar button | Hides the sidebar button |
 | Hide tab search button ✨ | Hides the ⌄ button at the top of the sidebar |
 | Hide Chat button | Hides the Chat button |
+| Hide page loading animation ✨ | Hides the orange bar that sweeps across the address field while a page loads |
 | **Sidebar & tab bar** | |
 | Hide pinned tab border | Removes the colored border around the selected pinned tab |
 | Profile emoji | Shows an emoji for this profile at the top of the sidebar |
