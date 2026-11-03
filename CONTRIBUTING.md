@@ -19,7 +19,23 @@ Thanks for helping out. The short version: small changes, checked by hand in Dia
 | `src/ui.cpp` | Settings → Patches, and the tweaks that need real code (Arc URL bar, toolbar slide, ...) |
 | `src/diatweaks.cpp` | The `diatweaks` command: opens Dia, loads the add-on, edits `tweaks.conf` |
 | `src/engine.h` | What `tap.cpp` and `ui.cpp` share |
-| `gen-winrt.cmd` | Makes C++/WinRT headers from the WinUI metadata in your Dia install |
+| `gen-winrt.cmd` | Makes C++/WinRT headers from the WinUI metadata in your Dia install (or NuGet without Dia) |
+| `.github/workflows/release.yml` | Builds and publishes a release when a `v*` tag is pushed |
+
+## Releasing
+
+Everyone on a release gets offered the new one in **Settings → Patches → Updates**, with its notes.
+
+1. On `main`, tag the commit and push the tag:
+
+   ```powershell
+   git tag v1.1.0; git push origin v1.1.0
+   ```
+
+2. The Release workflow builds `WinDiaTweaks.zip` (against the same WinUI metadata as Dia, from NuGet), and publishes the release with `install.ps1`.
+3. The notes list the `feat:` and `fix:` commits since the last tag. To write them yourself, use an annotated tag: `git tag -a v1.1.0 -m "..."` (Markdown works).
+
+Versions follow [SemVer](https://semver.org): new tweaks bump the minor version, fixes the patch version. To rebuild an existing release, run the workflow by hand with its tag.
 
 ## Adding a tweak
 

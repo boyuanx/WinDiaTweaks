@@ -33,10 +33,13 @@
 #include <winrt/Microsoft.UI.Xaml.Media.h>
 #include <winrt/Microsoft.UI.Xaml.Shapes.h>
 
+#include <atomic>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <set>
 #include <sstream>
+#include <thread>
 
 #include "engine.h"
 
@@ -565,7 +568,8 @@ static void ApplyPreset(const std::wstring& preset) {
                                                L"hideChatButton", L"hideTabHoverCard",    L"windowMaterial"};
     std::vector<std::pair<std::wstring, bool>> states;
     for (auto& t : Engine_Tweaks())
-        if (t.key != L"preset") states.push_back({t.key, preset == L"arc" && arc.count(t.key) > 0});
+        if (t.key != L"preset" && t.key != L"checkForUpdates")  // a setting, not a patch
+            states.push_back({t.key, preset == L"arc" && arc.count(t.key) > 0});
     if (preset == L"arc") values.push_back({L"windowMaterial", L"acrylic"});
     Engine_SetMany(states, values);
 }
@@ -612,6 +616,359 @@ static mux::FrameworkElement PresetRow() {
     return row;
 }
 
+// ---- Updates: newest Dia and WinDiaTweaks. `diatweaks check` finds them (in the background, so Dia never
+// waits on the network); installing runs `diatweaks update` in a window of its own, outside Dia, because
+// it closes Dia and replaces files Dia has loaded.
+
+struct UpdateState {
+    std::map<std::string, std::wstring> found;  // what `diatweaks check` printed
+    bool checking = false, checked = false;
+    std::wstring when;  // time of the last check, e.g. 14:05
+};
+static std::mutex g_updMx;
+static UpdateState g_upd;
+static std::atomic<int> g_updGen{0};               // bumped on every change, so pages know to redraw
+static std::atomic<ULONGLONG> g_nextAutoCheck{0};  // GetTickCount64() of the next automatic check
+
+static std::wstring FromUtf8(const std::string& s) {
+    if (s.empty()) return {};
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
+    std::wstring w(n, 0);
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), w.data(), n);
+    return w;
+}
+
+static std::wstring ToolPath() { return Engine_Dir() + L"\\diatweaks.exe"; }
+
+// Runs diatweaks.exe with these arguments, hidden, and returns what it printed.
+static std::string ToolOutput(const std::wstring& args) {
+    SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
+    HANDLE rd = nullptr, wr = nullptr;
+    if (!CreatePipe(&rd, &wr, &sa, 0)) return {};
+    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+    // Hand the child only the pipe, none of Dia's other inheritable handles.
+    SIZE_T size = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &size);
+    std::vector<char> attrs(size);
+    auto list = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attrs.data());
+    InitializeProcThreadAttributeList(list, 1, 0, &size);
+    UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &wr, sizeof(wr), nullptr, nullptr);
+    STARTUPINFOEXW si{};
+    si.StartupInfo.cb = sizeof(si);
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdOutput = wr;
+    si.StartupInfo.hStdError = wr;
+    si.lpAttributeList = list;
+    std::wstring exe = ToolPath(), cmd = L"\"" + exe + L"\" " + args;
+    PROCESS_INFORMATION pi{};
+    BOOL ok = CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
+                             nullptr, Engine_Dir().c_str(), &si.StartupInfo, &pi);
+    DeleteProcThreadAttributeList(list);
+    CloseHandle(wr);
+    if (!ok) {
+        Log("updates: can't run diatweaks.exe (%lu)", GetLastError());
+        CloseHandle(rd);
+        return {};
+    }
+    // Never wait forever on a stuck network.
+    HANDLE watch = nullptr;
+    if (DuplicateHandle(GetCurrentProcess(), pi.hProcess, GetCurrentProcess(), &watch, 0, FALSE, DUPLICATE_SAME_ACCESS))
+        std::thread([watch] {
+            if (WaitForSingleObject(watch, 90000) == WAIT_TIMEOUT) TerminateProcess(watch, 1);
+            CloseHandle(watch);
+        }).detach();
+    std::string out;
+    char buf[4096];
+    DWORD n = 0;
+    while (ReadFile(rd, buf, sizeof(buf), &n, nullptr) && n) out.append(buf, n);
+    CloseHandle(rd);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return out;
+}
+
+static void StartUpdateCheck() {
+    {
+        std::lock_guard<std::mutex> lk(g_updMx);
+        if (g_upd.checking) return;
+        g_upd.checking = true;
+    }
+    g_updGen++;
+    std::thread([] {
+        std::map<std::string, std::wstring> found;
+        std::istringstream in(ToolOutput(L"check"));
+        std::string line;
+        while (std::getline(in, line)) {
+            size_t eq = line.find('=');
+            if (eq == std::string::npos) continue;
+            std::string v;
+            for (size_t i = eq + 1; i < line.size(); i++) {
+                if (line[i] == '\\' && i + 1 < line.size()) {
+                    char c = line[++i];
+                    v += c == 'n' ? '\n' : c;
+                } else if (line[i] != '\r') {
+                    v += line[i];
+                }
+            }
+            found[line.substr(0, eq)] = FromUtf8(v);
+        }
+        SYSTEMTIME t;
+        GetLocalTime(&t);
+        wchar_t when[16];
+        swprintf(when, 16, L"%02u:%02u", t.wHour, t.wMinute);
+        {
+            std::lock_guard<std::mutex> lk(g_updMx);
+            g_upd.found = found;
+            g_upd.checking = false;
+            g_upd.checked = true;
+            g_upd.when = when;
+        }
+        Log("updates: Dia %s -> %s, WinDiaTweaks %s -> %s", N(found["dia.installed"]).c_str(),
+            N(found["dia.latest"]).c_str(), N(found["tweaks.installed"]).c_str(), N(found["tweaks.latest"]).c_str());
+        g_updGen++;
+    }).detach();
+}
+
+static UpdateState UpdateSnapshot() {
+    std::lock_guard<std::mutex> lk(g_updMx);
+    return g_upd;
+}
+
+// "Check for updates automatically": shortly after Dia opens, then every 6 hours it stays open.
+static void MaybeAutoCheck() {
+    if (!Engine_TweakOn(L"checkForUpdates") || Engine_SafeMode()) return;
+    ULONGLONG now = GetTickCount64(), next = g_nextAutoCheck;
+    if (next == 0) {
+        g_nextAutoCheck.compare_exchange_strong(next, now + 20000);
+        return;
+    }
+    if (now >= next && g_nextAutoCheck.compare_exchange_strong(next, now + 6ull * 3600 * 1000)) StartUpdateCheck();
+}
+
+// Runs `diatweaks <args>` in its own console window. Through `detach`, so the window's process is
+// started outside Dia's package: Dia's package would close it together with Dia.
+static bool RunToolWindow(const std::wstring& args) {
+    SIZE_T size = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &size);
+    std::vector<char> attrs(size);
+    auto list = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attrs.data());
+    InitializeProcThreadAttributeList(list, 1, 0, &size);
+    DWORD policy = PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_ENABLE_PROCESS_TREE;
+    bool haveAttr = UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_DESKTOP_APP_POLICY, &policy, sizeof(policy),
+                                              nullptr, nullptr);
+    STARTUPINFOEXW si{};
+    si.StartupInfo.cb = sizeof(si);
+    if (haveAttr) si.lpAttributeList = list;
+    std::wstring exe = ToolPath(), cmd = L"\"" + exe + L"\" detach " + args;
+    PROCESS_INFORMATION pi{};
+    BOOL ok = CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE,
+                             CREATE_NO_WINDOW | (haveAttr ? EXTENDED_STARTUPINFO_PRESENT : 0), nullptr,
+                             Engine_Dir().c_str(), &si.StartupInfo, &pi);
+    DeleteProcThreadAttributeList(list);
+    if (!ok) {
+        Log("updates: can't start diatweaks %s (%lu)", N(args).c_str(), GetLastError());
+        return false;
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return true;
+}
+
+static void OpenUrl(const std::wstring& url) {
+    if (!url.empty()) ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+// Release notes are Markdown; show them as plain text.
+static std::wstring PlainNotes(const std::wstring& md) {
+    std::wistringstream in(md);
+    std::wstring line, out;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == L'\r') line.pop_back();
+        if (!line.empty() && line.back() == L'\\') line.pop_back();  // Markdown line break
+        size_t a = line.find_first_not_of(L" \t");
+        if (a != std::wstring::npos && line[a] == L'#') line = line.substr(line.find_first_not_of(L"# \t", a));
+        else if (a != std::wstring::npos && (line.compare(a, 2, L"- ") == 0 || line.compare(a, 2, L"* ") == 0))
+            line = line.substr(0, a) + L"• " + line.substr(a + 2);
+        std::wstring clean;
+        for (size_t i = 0; i < line.size(); i++) {
+            if (line.compare(i, 2, L"**") == 0) {
+                i++;
+                continue;
+            }
+            if (line[i] == L'`') continue;
+            if (line[i] == L'[') {  // [text](url) -> text
+                size_t close = line.find(L"](", i), end = close == std::wstring::npos ? close : line.find(L')', close);
+                if (end != std::wstring::npos) {
+                    clean += line.substr(i + 1, close - i - 1);
+                    i = end;
+                    continue;
+                }
+            }
+            clean += line[i];
+        }
+        if (clean.empty() && (out.empty() || out.size() >= 2 && out.compare(out.size() - 2, 2, L"\n\n") == 0)) continue;
+        out += clean + L"\n";
+    }
+    while (!out.empty() && out.back() == L'\n') out.pop_back();
+    return out;
+}
+
+static thread_local winrt::weak_ref<muxc::Border> t_updHost;
+static thread_local int t_updShown = -1;
+
+// A row with an optional button (empty label: none).
+static mux::FrameworkElement UpdateRow(const wchar_t* glyph, const std::wstring& title, const std::wstring& desc,
+                                       const std::wstring& button, std::function<void()> onClick, bool accent = false) {
+    auto row = ButtonRow(glyph, title, desc, button.empty() ? L"-" : button, onClick).as<muxc::Grid>();
+    auto b = row.Children().GetAt(row.Children().Size() - 1).as<muxc::Button>();
+    if (button.empty()) row.Children().RemoveAtEnd();
+    else if (accent)
+        if (auto style = Resource(L"AccentButtonStyle").try_as<mux::Style>()) b.Style(style);
+    return row;
+}
+
+static void FillUpdates(muxc::Border host) {
+    t_updShown = g_updGen;
+    UpdateState u = UpdateSnapshot();
+    auto get = [&](const char* k) { return u.found.count(k) ? u.found[k] : std::wstring(); };
+    std::vector<mux::FrameworkElement> rows;
+    bool noAnswer = u.checked && get("tweaks.installed").empty();  // diatweaks.exe missing or failed
+
+    // "Updating..." on the button, so a second click doesn't start a second update.
+    auto starting = [](const std::wstring& args) {
+        return [args] {
+            if (!RunToolWindow(args)) return;
+            std::lock_guard<std::mutex> lk(g_updMx);
+            g_upd.found["busy"] = args;
+            g_updGen++;
+        };
+    };
+    bool busy = !get("busy").empty();
+
+    bool diaNew = get("dia.available") == L"1", tweaksNew = get("tweaks.available") == L"1";
+    if (diaNew && tweaksNew)
+        rows.push_back(UpdateRow(L"\uE896", L"Dia and WinDiaTweaks both have updates",
+                                 L"Dia closes, both install, and it opens again with your patches.",
+                                 busy ? L"Updating..." : L"Update both", starting(L"update"), true));
+
+    // Dia
+    std::wstring diaDesc, diaButton = L"Changelog";
+    std::function<void()> diaClick = [] { OpenUrl(L"https://www.diabrowser.com/changelog"); };
+    if (!u.checked) diaDesc = u.checking ? L"Checking for updates..." : L"Not checked yet.";
+    else if (noAnswer) diaDesc = L"Couldn't check: diatweaks.exe didn't answer. See tap.log.";
+    else if (get("dia.installed").empty()) diaDesc = L"Couldn't find Dia's version: " + get("dia.error") + L".";
+    else if (diaNew) {
+        diaDesc = L"Dia " + get("dia.latest") + L" is available. You have " + get("dia.installed") +
+                  L". Dia closes while it installs, then opens again with your patches.";
+        diaButton = busy ? L"Updating..." : L"Update Dia";
+        diaClick = starting(L"update dia");
+    } else if (get("dia.latest").empty())
+        diaDesc = L"Version " + get("dia.installed") + L". Couldn't check for a newer one: " + get("dia.error") + L".";
+    else diaDesc = L"Version " + get("dia.installed") + L". Up to date.";
+    rows.push_back(UpdateRow(L"\uE774", L"Dia", diaDesc, diaButton, diaClick, diaNew && !busy));
+
+    // WinDiaTweaks
+    std::wstring have = get("tweaks.installed"), latest = get("tweaks.latest"), url = get("tweaks.url");
+    bool git = get("tweaks.source") == L"git";
+    std::wstring twDesc, twButton = L"Release notes";
+    std::function<void()> twClick = [url] { OpenUrl(url.empty() ? L"https://github.com/zioder/WinDiaTweaks/releases" : url); };
+    if (!u.checked) twDesc = u.checking ? L"Checking for updates..." : L"Not checked yet.";
+    else if (noAnswer) twDesc = L"Couldn't check.";
+    else if (tweaksNew) {
+        twDesc = L"WinDiaTweaks " + latest + L" is available. You have " + have + L"." +
+                 (git ? L" It updates this clone with git pull and rebuilds it." : L"") +
+                 L" Dia closes while it installs, then opens again with your patches.";
+        twButton = busy ? L"Updating..." : L"Update";
+        twClick = starting(L"update tweaks");
+    } else if (latest.empty())
+        twDesc = L"Version " + have + L". " +
+                 (get("tweaks.error") == L"no releases yet" ? std::wstring(L"No releases published yet.")
+                                                            : L"Couldn't check for a newer one: " + get("tweaks.error") + L".");
+    else twDesc = L"Version " + have + L". Up to date.";
+    auto twRow = UpdateRow(L"\uE945", L"WinDiaTweaks", twDesc, twButton, twClick, tweaksNew && !busy);
+    std::wstring notes = PlainNotes(get("tweaks.notes"));
+    if (!notes.empty()) {
+        muxc::StackPanel withNotes;
+        withNotes.Children().Append(twRow);
+        muxc::StackPanel box;
+        box.Padding({40, 0, 12, 12});
+        box.Spacing(4);
+        muxc::TextBlock head;
+        head.Text((tweaksNew ? L"What's new in " : L"What's new in WinDiaTweaks ") + latest);
+        head.FontSize(12);
+        head.FontWeight(winrt::Microsoft::UI::Text::FontWeights::SemiBold());
+        box.Children().Append(head);
+        muxc::TextBlock body;
+        body.Text(notes);
+        body.FontSize(12);
+        body.TextWrapping(mux::TextWrapping::Wrap);
+        body.MaxLines(16);
+        body.TextTrimming(mux::TextTrimming::CharacterEllipsis);
+        body.IsTextSelectionEnabled(true);
+        body.Foreground(BrushRes(L"TextFillColorSecondaryBrush", Rgba(0xc5, 0xc5, 0xc5)));
+        box.Children().Append(body);
+        withNotes.Children().Append(box);
+        rows.push_back(withNotes);
+    } else {
+        rows.push_back(twRow);
+    }
+
+    // Settings
+    for (auto& t : Engine_Tweaks())
+        if (t.key == L"checkForUpdates") rows.push_back(Row(t));
+    std::wstring when = u.checking ? L"Checking..." : u.checked ? L"Last checked at " + u.when + L"." : L"Not checked yet.";
+    auto check = UpdateRow(L"\uE895", L"Check for updates", when, L"Check now", [] { StartUpdateCheck(); });
+    if (u.checking) check.as<muxc::Grid>().Children().GetAt(2).as<muxc::Button>().IsEnabled(false);
+    rows.push_back(check);
+
+    muxc::StackPanel list;
+    for (size_t i = 0; i < rows.size(); i++) {
+        if (i) {
+            muxc::Border line;
+            line.Height(1);
+            line.Background(t_card.border);
+            list.Children().Append(line);
+        }
+        list.Children().Append(rows[i]);
+    }
+    host.Child(list);
+}
+
+static mux::FrameworkElement UpdatesSection() {
+    muxc::Border host;
+    t_updHost = winrt::make_weak(host);
+    {
+        std::lock_guard<std::mutex> lk(g_updMx);
+        g_upd.found.erase("busy");  // a fresh page: show the buttons again
+    }
+    UpdateState u = UpdateSnapshot();
+    if (!u.checked && !u.checking) StartUpdateCheck();
+    FillUpdates(host);
+    return Section(L"Updates", {host});
+}
+
+// Redraws the Updates section when a check finishes, and badges the Patches item when there's an update.
+static void SyncUpdates() {
+    MaybeAutoCheck();
+    int gen = g_updGen;
+    if (auto host = t_updHost.get(); host && gen != t_updShown) FillUpdates(host);
+    UpdateState u = UpdateSnapshot();
+    int count = (u.found["dia.available"] == L"1") + (u.found["tweaks.available"] == L"1");
+    for (auto& h : t_navs) {
+        if (!h.item) continue;
+        try {
+            auto badge = h.item.InfoBadge();
+            if (!count && badge) h.item.InfoBadge(nullptr);
+            else if (count && (!badge || badge.Value() != count)) {
+                muxc::InfoBadge b;
+                b.Value(count);
+                h.item.InfoBadge(b);
+            }
+        } catch (...) {
+        }
+    }
+}
+
 static mux::FrameworkElement BuildPage() {
     EnsureCardLook();
     t_toggles.clear();
@@ -649,12 +1006,13 @@ static mux::FrameworkElement BuildPage() {
                        })}));
     }
 
+    stack.Children().Append(UpdatesSection());
     stack.Children().Append(Section(L"Preset", {PresetRow()}));
 
     std::vector<std::wstring> order;
     std::map<std::wstring, std::vector<mux::FrameworkElement>> sections;
     for (auto& t : Engine_Tweaks()) {
-        if (t.key == L"preset") continue;  // shown on top
+        if (t.key == L"preset" || t.key == L"checkForUpdates") continue;  // shown on top, under Preset / Updates
         std::wstring s = t.section.empty() ? L"Other" : t.section;
         if (!sections.count(s)) order.push_back(s);
         sections[s].push_back(Row(t));
@@ -3421,6 +3779,7 @@ bool Ui_Tick() {
         if (tick % 5 == 0) {
             ScanForSettings();
             SyncToggles();
+            SyncUpdates();
             RunProbe();
         }
     } catch (winrt::hresult_error const& e) {

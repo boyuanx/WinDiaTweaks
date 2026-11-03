@@ -51,6 +51,18 @@ At the top of **Patches**, **Preset** sets everything at once:
 
 ## Install
 
+Install [Dia](https://www.diabrowser.com), then paste this into PowerShell:
+
+```powershell
+irm https://github.com/zioder/WinDiaTweaks/releases/latest/download/install.ps1 | iex
+```
+
+It downloads the newest [release](https://github.com/zioder/WinDiaTweaks/releases) into `%USERPROFILE%\WinDiaTweaks\bin`, adds **Dia (Tweaks)** to the Start menu and reopens Dia with the tweaks. Open Dia from **Dia (Tweaks)** from now on, then go to **Settings → Patches**.
+
+### Build it yourself
+
+Prefer to compile it from the code here?
+
 1. Install [Dia](https://www.diabrowser.com) and [Git](https://git-scm.com/download/win).
 2. Install Microsoft's C++ build tools (free). In PowerShell:
 
@@ -79,23 +91,28 @@ It builds WinDiaTweaks on your PC, adds **Dia (Tweaks)** to the Start menu and r
 | `diatweaks set windowMaterial acrylic` | Sets a tweak's option |
 | `diatweaks status` | Shows whether Dia is running with the tweaks, and which are on |
 | `diatweaks restart` | Closes Dia and opens it again with the tweaks |
+| `diatweaks check` | Shows the installed and newest versions of Dia and WinDiaTweaks |
+| `diatweaks update` | Installs updates to Dia and WinDiaTweaks (or `update dia`, `update tweaks`) |
 
 You can name a tweak by its key (`hideToolbar`) or by the title shown in Settings (`"Hide toolbar (reveal on hover)"`).
 
 ## Updating
 
-```powershell
-cd "$HOME\WinDiaTweaks"; git pull; .\install.cmd
-```
+**Settings → Patches → Updates** shows the version of Dia and of WinDiaTweaks you have, and whether there's a newer one. It checks when Dia opens (switch off **Check for updates automatically** to only check when you press **Check now**), puts a badge on **Patches** when something is new, and shows what changed in the newest WinDiaTweaks. **Update** closes Dia, installs the update in a small window and reopens Dia with your patches; your choices are kept.
 
-After Dia itself updates, run the same. If the build complains, delete the `gen` and `winmd` folders and run `install.cmd` again: they're made from the Dia you have installed.
+- **Dia** updates from the same channel it was installed from (stable or release candidate).
+- **WinDiaTweaks** updates from the newest [release](https://github.com/zioder/WinDiaTweaks/releases). If you built it yourself, it runs `git pull` and rebuilds it instead.
+
+Or from PowerShell: `diatweaks check` to see what's new, `diatweaks update` to install it (`diatweaks update dia` or `diatweaks update tweaks` for one of them).
+
+Building it yourself, if the build complains after Dia updates, delete the `gen` and `winmd` folders and run `install.cmd` again: they're made from the Dia you have installed.
 
 ## FAQ
 
 <details>
 <summary><strong>Is it safe?</strong></summary>
 
-You compile it yourself from the code in this repo, so you can see everything it does. It only rearranges and restyles Dia's interface; it has no access to what you browse, your history or your saved passwords. Your choices live in one plain text file, `bin\tweaks.conf`.
+Releases are built by [GitHub Actions](.github/workflows/release.yml) from the code in this repo, and you can compile it yourself instead, so you can see everything it does. It only rearranges and restyles Dia's interface; it has no access to what you browse, your history or your saved passwords. Your choices live in one plain text file, `bin\tweaks.conf`.
 
 </details>
 
@@ -116,7 +133,7 @@ No. Nothing stays running after you close Dia, and nothing starts with Windows. 
 <details>
 <summary><strong>My antivirus complains.</strong></summary>
 
-Loading an add-on into another app is something antivirus software watches for. You built it yourself from this code, so you can read exactly what it does. Allow `bin\diatweaks.exe` and `bin\DiaTweaksTap.dll` if it's blocked.
+Loading an add-on into another app is something antivirus software watches for. It's built from this code, so you can read exactly what it does. Allow `bin\diatweaks.exe` and `bin\DiaTweaksTap.dll` if it's blocked.
 
 </details>
 
@@ -129,7 +146,7 @@ WinDiaTweaks watches for that: after two launches in a row where Dia closes almo
 
 ## Uninstall
 
-Run `uninstall.cmd` in the WinDiaTweaks folder. It removes the Start menu shortcut and reopens Dia without the tweaks. Then delete the folder.
+Run `uninstall.cmd` in the WinDiaTweaks folder (`bin` for an installed release). It removes the Start menu shortcut and reopens Dia without the tweaks. Then delete the folder.
 
 ## Credits
 

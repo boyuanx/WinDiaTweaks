@@ -940,7 +940,7 @@ void Engine_SetTweak(const std::wstring& key, bool on, const std::wstring* value
     SetInLines(lines, key, &on, value);
     // Changing one patch by hand leaves the preset: it becomes Custom.
     static const std::wstring custom = L"custom";
-    if (key != L"preset") SetInLines(lines, L"preset", nullptr, &custom);
+    if (key != L"preset" && key != L"checkForUpdates") SetInLines(lines, L"preset", nullptr, &custom);
     WriteConfLines(lines);
     ApplyConfigNow();
 }
