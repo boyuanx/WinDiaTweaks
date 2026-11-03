@@ -786,7 +786,14 @@ static std::wstring PlainNotes(const std::wstring& md) {
         if (!line.empty() && line.back() == L'\r') line.pop_back();
         if (!line.empty() && line.back() == L'\\') line.pop_back();  // Markdown line break
         size_t a = line.find_first_not_of(L" \t");
-        if (a != std::wstring::npos && line[a] == L'#') line = line.substr(line.find_first_not_of(L"# \t", a));
+        // Pictures, tables and code fences don't read as text: leave them to the release page.
+        if (a != std::wstring::npos && (line[a] == L'<' || line[a] == L'|' || line.compare(a, 2, L"![") == 0 ||
+                                        line.compare(a, 3, L"```") == 0))
+            continue;
+        if (a != std::wstring::npos && line[a] == L'#') {
+            size_t text = line.find_first_not_of(L"# \t", a);
+            line = text == std::wstring::npos ? L"" : line.substr(text);
+        }
         else if (a != std::wstring::npos && (line.compare(a, 2, L"- ") == 0 || line.compare(a, 2, L"* ") == 0))
             line = line.substr(0, a) + L"• " + line.substr(a + 2);
         std::wstring clean;
