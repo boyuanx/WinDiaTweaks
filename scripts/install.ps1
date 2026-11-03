@@ -1,7 +1,7 @@
 # Installs WinDiaTweaks from its newest release, or updates it. In PowerShell:
 #   irm https://github.com/zioder/WinDiaTweaks/releases/latest/download/install.ps1 | iex
 # It puts WinDiaTweaks in %USERPROFILE%\WinDiaTweaks\bin, adds "Dia (Tweaks)" to the Start menu and
-# opens Dia with the tweaks. Your choices in tweaks.conf are kept.
+# desktop and opens Dia with the tweaks. Your choices in tweaks.conf are kept.
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 if (-not (Get-AppxPackage TheBrowserCompany.Dia)) {
