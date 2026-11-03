@@ -38,6 +38,7 @@ At the top of **Patches**, **Preset** sets everything at once:
 | Hide Chat button | Hides the Chat button |
 | **Sidebar & tab bar** | |
 | Hide pinned tab border | Removes the colored border around the selected pinned tab |
+| Hide tab hover card ✨ | Stops the card with the page title, site and buttons from popping up when you hover a tab or pinned tab |
 | Profile emoji | Shows an emoji for this profile at the top of the sidebar |
 | Don't pop up downloads | Stops the downloads list from opening by itself for each download |
 | Translucent sidebar | Lets the page show through the sidebar when it floats over the page |

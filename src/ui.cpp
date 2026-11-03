@@ -1119,6 +1119,62 @@ static void UpdateDownloadsPopup() {
     });
 }
 
+// --- Hide tab hover card: the card (title, site, pin/bookmark/... buttons) Dia shows when the pointer
+// rests on a tab or pinned tab. It's a flyout whose content holds TitleText, SubtitleText and
+// ActionsRow; its FlyoutPresenter is collapsed, so nothing is drawn and nothing can be clicked.
+static thread_local std::vector<winrt::weak_ref<muxc::FlyoutPresenter>> t_hiddenCards;
+static thread_local bool t_cardPending = false;
+static thread_local winrt::event_token t_cardToken{};
+
+static void HideHoverCard(const mux::FrameworkElement& row) {
+    auto panel = muxm::VisualTreeHelper::GetParent(row);
+    if (!panel) return;
+    auto has = [&](const wchar_t* name) {
+        return FindVisual(panel, [name](const mux::DependencyObject& d) {
+                   auto fe = d.try_as<mux::FrameworkElement>();
+                   return fe && fe.Name() == name;
+               }) != nullptr;
+    };
+    if (!has(L"TitleText") || !has(L"SubtitleText")) return;
+    mux::DependencyObject p = panel;
+    for (int i = 0; p && i < 20; i++, p = muxm::VisualTreeHelper::GetParent(p)) {
+        auto fp = p.try_as<muxc::FlyoutPresenter>();
+        if (!fp) continue;
+        if (fp.Visibility() != mux::Visibility::Collapsed) {
+            fp.Visibility(mux::Visibility::Collapsed);
+            t_hiddenCards.push_back(winrt::make_weak(fp));
+            static int n = 0;
+            if (n++ < 5) Log("hid tab hover card");
+        }
+        return;
+    }
+}
+
+static void UpdateHoverCards() {
+    if (!Engine_TweakOn(L"hideTabHoverCard")) {
+        for (auto& w : t_hiddenCards)
+            if (auto fp = w.get()) fp.Visibility(mux::Visibility::Visible);
+        t_hiddenCards.clear();
+        return;
+    }
+    for (auto h : FindNodes(L"ActionsRow"))
+        if (auto row = Obj<mux::FrameworkElement>(h)) HideHoverCard(row);
+}
+
+// Runs before the next frame, so the card never shows up even for one frame.
+static void ScheduleHoverCards() {
+    if (t_cardPending || !Engine_TweakOn(L"hideTabHoverCard")) return;
+    t_cardPending = true;
+    t_cardToken = muxm::CompositionTarget::Rendering([](auto&&, auto&&) {
+        muxm::CompositionTarget::Rendering(t_cardToken);
+        t_cardPending = false;
+        try {
+            UpdateHoverCards();
+        } catch (...) {
+        }
+    });
+}
+
 // ---------------------------------------------------------------- Arc URL bar
 static double NowMs();
 // Arc/Zen-style sidebar: Dia's own sidebar toggle, back/forward/reload buttons and its real address
@@ -1892,6 +1948,7 @@ void Ui_ElementAdded(const std::wstring& name) {
         if (n++ < 40) Log("arc: %s added (%.0f)", N(name).c_str(), NowMs());
         ScheduleArcAdopt();
     }
+    if (name == L"ActionsRow") ScheduleHoverCards();
 }
 
 static void UpdateArcBar() {
@@ -2805,6 +2862,7 @@ bool Ui_Tick() {
             if (!Engine_TweakOn(L"arcUrlBar")) HookCommandBarPopovers();  // (Arc mode hooks them already)
         }
         UpdateNewTabMode();
+        UpdateHoverCards();
         if (tick % 3 == 0) {
             UpdateWindowMaterial();
             UpdateAddressField();
