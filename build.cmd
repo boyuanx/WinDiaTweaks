@@ -3,6 +3,11 @@ rem Builds bin\DiaTweaksTap.dll (the tweak engine) and bin\diatweaks.exe (the co
 rem Needs Visual Studio 2022 (or Build Tools) with the C++ workload and a Windows 10/11 SDK.
 setlocal
 cd /d "%~dp0"
+rem Version shown in Settings > Patches > Updates: the release tag in CI (WDT_VERSION), else what git
+rem says about this checkout (e.g. v1.2.0-3-gabc123), else "dev". Read before PATH is narrowed below.
+set "VER=%WDT_VERSION%"
+if not defined VER for /f "delims=" %%v in ('git describe --tags --always --dirty 2^>nul') do set "VER=%%v"
+if not defined VER set "VER=dev"
 where cl >nul 2>nul && goto build
 
 rem Find the C++ toolset and Windows SDK directly. (vcvars64.bat can fail on machines with a very long PATH.)
@@ -20,11 +25,13 @@ set "LIB=%VC%\lib\x64;%SDK%\Lib\%SV%\ucrt\x64;%SDK%\Lib\%SV%\um\x64"
 
 :build
 if not exist bin mkdir bin
+> bin\version.h echo #define WDT_VERSION L"%VER%"
 set FLAGS=/nologo /utf-8 /std:c++17 /O2 /EHsc /W3 /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS /MT
 rem C++/WinRT headers for Dia's WinUI live in gen\ (made from Dia's own .winmd files by gen-winrt.cmd).
 if not exist gen\winrt\Microsoft.UI.Xaml.Controls.h call "%~dp0gen-winrt.cmd" || exit /b 1
 for /f "delims=" %%v in ('dir /b /ad /o-n "%ProgramFiles(x86)%\Windows Kits\10\Include\10.*" 2^>nul') do if not defined SDKV set "SDKV=%%v"
 cl %FLAGS% /bigobj /I gen /I "%ProgramFiles(x86)%\Windows Kits\10\Include\%SDKV%\cppwinrt" /LD src\tap.cpp src\ui.cpp /Fobin\ /Febin\DiaTweaksTap.dll /link /DEF:src\tap.def ole32.lib oleaut32.lib user32.lib gdi32.lib shell32.lib windowsapp.lib || exit /b 1
-cl %FLAGS% src\diatweaks.cpp /Fobin\ /Febin\diatweaks.exe /link ole32.lib user32.lib shell32.lib || exit /b 1
-if not exist bin\tweaks.conf copy /y tweaks.conf bin\tweaks.conf >nul
-echo Built bin\diatweaks.exe and bin\DiaTweaksTap.dll
+cl %FLAGS% /I bin /I "%ProgramFiles(x86)%\Windows Kits\10\Include\%SDKV%\cppwinrt" src\diatweaks.cpp /Fobin\ /Febin\diatweaks.exe /link ole32.lib user32.lib shell32.lib windowsapp.lib || exit /b 1
+rem bin\tweaks.conf also holds your on/off choices: bring in new and changed tweaks, keep your choices.
+if exist bin\tweaks.conf (bin\diatweaks.exe merge-conf tweaks.conf bin\tweaks.conf >nul || exit /b 1) else copy /y tweaks.conf bin\tweaks.conf >nul
+echo Built bin\diatweaks.exe and bin\DiaTweaksTap.dll (%VER%)

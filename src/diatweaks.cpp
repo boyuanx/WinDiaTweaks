@@ -1,18 +1,39 @@
 // diatweaks.exe - attaches DiaTweaksTap.dll to a running Dia (Windows) and manages tweaks.conf.
 
 #define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 #include <windows.h>
 #include <shellapi.h>
 #include <shobjidl.h>
 #include <tlhelp32.h>
 #include <appmodel.h>
+#include <shlobj.h>
+#include <fcntl.h>
+#include <io.h>
 
+#include <algorithm>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
+#include <map>
 #include <string>
 #include <vector>
 
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Windows.ApplicationModel.h>
+#include <winrt/Windows.Data.Json.h>
+#include <winrt/Windows.Management.Deployment.h>
+#include <winrt/Windows.Storage.Streams.h>
+#include <winrt/Windows.Web.Http.h>
+#include <winrt/Windows.Web.Http.Filters.h>
+#include <winrt/Windows.Web.Http.Headers.h>
+
 #include "shared.h"
+#include "version.h"  // bin\version.h, written by build.cmd
+#ifndef WDT_VERSION
+#define WDT_VERSION L"dev"
+#endif
 
 static std::wstring g_dir;  // folder of diatweaks.exe
 
@@ -453,9 +474,540 @@ static int CmdSet(const std::wstring& key, const std::wstring& value) {
     return 1;
 }
 
+// ---------------------------------------------------------------- versions and updates
+// `check` reports the installed and newest versions of Dia and WinDiaTweaks (read by Settings > Patches
+// > Updates); `update` installs them. WinDiaTweaks comes from this repo's GitHub releases (or `git pull`
+// for a clone), Dia from the App Installer feed its package was installed from.
+
+namespace wdm = winrt::Windows::Management::Deployment;
+namespace wweb = winrt::Windows::Web::Http;
+using winrt::Windows::Foundation::Uri;
+
+static const wchar_t kRepo[] = L"zioder/WinDiaTweaks";
+static const wchar_t kZip[] = L"WinDiaTweaks.zip";
+static const wchar_t kDiaFamily[] = L"TheBrowserCompany.Dia_ttt1ap7aakyb4";
+
+// "v1.2.3", "1.5.0.591" or git's "v1.2.0-3-gabc123-dirty" (3 commits after v1.2.0). No digits: unknown.
+static std::vector<int> VersionNumbers(const std::wstring& s) {
+    std::vector<int> n;
+    size_t i = (!s.empty() && (s[0] == L'v' || s[0] == L'V')) ? 1 : 0;
+    while (i < s.size() && iswdigit(s[i])) {
+        int x = 0;
+        while (i < s.size() && iswdigit(s[i])) x = x * 10 + (s[i++] - L'0');
+        n.push_back(x);
+        if (i < s.size() && s[i] == L'.') i++;
+        else break;
+    }
+    return n;
+}
+
+// Is `latest` newer than `installed`? A build with no version (a plain clone) counts as older.
+static bool Newer(const std::wstring& latest, const std::wstring& installed) {
+    auto l = VersionNumbers(latest), i = VersionNumbers(installed);
+    if (l.empty()) return false;
+    if (i.empty()) return true;
+    for (size_t k = 0; k < std::max(l.size(), i.size()); k++) {
+        int a = k < l.size() ? l[k] : 0, b = k < i.size() ? i[k] : 0;
+        if (a != b) return a > b;
+    }
+    return false;
+}
+
+// Built in a git clone (bin\ next to .git): updates come with `git pull` and a rebuild.
+static std::wstring RepoRoot() {
+    std::wstring root = g_dir.substr(0, g_dir.find_last_of(L'\\'));
+    return GetFileAttributesW((root + L"\\.git").c_str()) != INVALID_FILE_ATTRIBUTES ? root : L"";
+}
+
+static std::wstring Message(const winrt::hresult_error& e) {
+    std::wstring m(e.message());
+    while (!m.empty() && (m.back() == L'\n' || m.back() == L'\r' || m.back() == L' ')) m.pop_back();
+    if (m.empty()) {
+        wchar_t b[32];
+        swprintf(b, 32, L"error 0x%08lx", (unsigned long)e.code());
+        m = b;
+    }
+    return m;
+}
+
+static wweb::HttpClient Http() {
+    wweb::Filters::HttpBaseProtocolFilter filter;
+    filter.CacheControl().ReadBehavior(wweb::Filters::HttpCacheReadBehavior::NoCache);
+    filter.CacheControl().WriteBehavior(wweb::Filters::HttpCacheWriteBehavior::NoCache);
+    wweb::HttpClient client(filter);
+    client.DefaultRequestHeaders().UserAgent().TryParseAdd(L"WinDiaTweaks");
+    return client;
+}
+
+static wweb::HttpResponseMessage Get(const std::wstring& url, std::wstring& error) {
+    try {
+        auto client = Http();
+        if (url.find(L"api.github.com") != std::wstring::npos)
+            client.DefaultRequestHeaders().Accept().TryParseAdd(L"application/vnd.github+json");
+        auto r = client.GetAsync(Uri(url)).get();
+        if (r.IsSuccessStatusCode()) return r;
+        error = r.StatusCode() == wweb::HttpStatusCode::NotFound ? L"not found"
+                                                                 : L"the server answered " + std::to_wstring((int)r.StatusCode());
+    } catch (winrt::hresult_error const& e) {
+        error = Message(e);
+    }
+    return nullptr;
+}
+
+static std::wstring GetText(const std::wstring& url, std::wstring& error) {
+    auto r = Get(url, error);
+    if (!r) return {};
+    try {
+        return std::wstring(r.Content().ReadAsStringAsync().get());
+    } catch (winrt::hresult_error const& e) {
+        error = Message(e);
+    }
+    return {};
+}
+
+static bool Download(const std::wstring& url, const std::wstring& file, std::wstring& error) {
+    auto r = Get(url, error);
+    if (!r) return false;
+    try {
+        auto buf = r.Content().ReadAsBufferAsync().get();
+        std::ofstream out(file, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(buf.data()), buf.Length());
+        if (out.good()) return true;
+        error = L"can't write " + file;
+    } catch (winrt::hresult_error const& e) {
+        error = Message(e);
+    }
+    return false;
+}
+
+struct Release {
+    std::wstring tag, url, notes, zip, error;
+};
+
+// The GitHub repo releases come from; WDT_REPO=owner/name overrides it (for forks and testing).
+static std::wstring Repo() {
+    wchar_t b[256];
+    DWORD n = GetEnvironmentVariableW(L"WDT_REPO", b, 256);
+    return n && n < 256 ? std::wstring(b) : std::wstring(kRepo);
+}
+
+static Release LatestRelease() {
+    Release r;
+    std::wstring text = GetText(L"https://api.github.com/repos/" + Repo() + L"/releases/latest", r.error);
+    if (text.empty()) {
+        if (r.error == L"not found") r.error = L"no releases yet";
+        return r;
+    }
+    try {
+        namespace json = winrt::Windows::Data::Json;
+        auto o = json::JsonObject::Parse(text);
+        auto str = [&](const json::JsonObject& obj, const wchar_t* k) -> std::wstring {
+            if (!obj.HasKey(k)) return {};
+            auto v = obj.GetNamedValue(k);
+            return v.ValueType() == json::JsonValueType::String ? std::wstring(v.GetString()) : L"";
+        };
+        r.tag = str(o, L"tag_name");
+        r.url = str(o, L"html_url");
+        r.notes = str(o, L"body");
+        if (o.HasKey(L"assets"))
+            for (auto const& a : o.GetNamedArray(L"assets")) {
+                auto asset = a.GetObject();
+                if (str(asset, L"name") == kZip) r.zip = str(asset, L"browser_download_url");
+            }
+        if (r.tag.empty()) r.error = L"unexpected answer from GitHub";
+    } catch (winrt::hresult_error const& e) {
+        r.error = L"unexpected answer from GitHub (" + Message(e) + L")";
+    }
+    return r;
+}
+
+struct DiaVersion {
+    std::wstring installed, latest, feed, error;
+};
+
+static std::wstring VersionText(const winrt::Windows::ApplicationModel::PackageVersion& v) {
+    wchar_t b[64];
+    swprintf(b, 64, L"%u.%u.%u.%u", v.Major, v.Minor, v.Build, v.Revision);
+    return b;
+}
+
+// Dia installs from an App Installer file (stable, release candidate, ...); Windows remembers which one,
+// and that file names the newest Dia on the same channel.
+static DiaVersion CheckDia() {
+    DiaVersion d;
+    bool arm = false;
+    try {
+        wdm::PackageManager pm;
+        for (auto const& p : pm.FindPackagesForUser(L"", kDiaFamily)) {
+            d.installed = VersionText(p.Id().Version());
+            arm = p.Id().Architecture() == winrt::Windows::System::ProcessorArchitecture::Arm64;
+            try {
+                if (auto info = p.GetAppInstallerInfo()) d.feed = std::wstring(info.Uri().AbsoluteUri());
+            } catch (...) {
+            }
+        }
+    } catch (winrt::hresult_error const& e) {
+        d.error = Message(e);
+        return d;
+    }
+    if (d.installed.empty()) {
+        d.error = L"Dia isn't installed";
+        return d;
+    }
+    if (d.feed.empty())
+        d.feed = std::wstring(L"https://releases.diabrowser.com/windows/release/Dia.") + (arm ? L"arm64" : L"x64") +
+                 L".appinstaller";
+    std::wstring xml = GetText(d.feed, d.error);
+    size_t at = xml.find(L"<MainPackage");
+    if (at != std::wstring::npos) at = xml.find(L"Version=\"", at);
+    if (at != std::wstring::npos) {
+        at += 9;
+        d.latest = xml.substr(at, xml.find(L'"', at) - at);
+    } else if (d.error.empty()) {
+        d.error = L"unexpected answer from Dia's update server";
+    }
+    return d;
+}
+
+// `check`: one key=value per line, UTF-8, newlines in values written as \n.
+static int CmdCheck() {
+    _setmode(_fileno(stdout), _O_BINARY);
+    auto put = [](const char* key, const std::wstring& value) {
+        std::string v;
+        for (char c : N(value)) {
+            if (c == '\\') v += "\\\\";
+            else if (c == '\n') v += "\\n";
+            else if (c != '\r') v += c;
+        }
+        printf("%s=%s\n", key, v.c_str());
+    };
+    put("tweaks.installed", WDT_VERSION);
+    put("tweaks.source", RepoRoot().empty() ? L"release" : L"git");
+    Release r = LatestRelease();
+    put("tweaks.latest", r.tag);
+    put("tweaks.url", r.url.empty() ? L"https://github.com/" + Repo() + L"/releases" : r.url);
+    put("tweaks.notes", r.notes);
+    put("tweaks.available", Newer(r.tag, WDT_VERSION) ? L"1" : L"0");
+    put("tweaks.error", r.error);
+    DiaVersion d = CheckDia();
+    put("dia.installed", d.installed);
+    put("dia.latest", d.latest);
+    put("dia.available", Newer(d.latest, d.installed) ? L"1" : L"0");
+    put("dia.error", d.error);
+    fflush(stdout);
+    return 0;
+}
+
+// Ends a command that may have its own console window (opened from Settings): leave the result on
+// screen for a moment, or until a key is pressed when something went wrong.
+static int Finish(int code) {
+    DWORD list[4];
+    if (GetConsoleProcessList(list, 4) > 1) return code;  // started from a shell, which stays open
+    if (code) {
+        wprintf(L"\nPress any key to close this window.\n");
+        HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
+        FlushConsoleInputBuffer(in);
+        INPUT_RECORD rec;
+        DWORD n;
+        while (ReadConsoleInputW(in, &rec, 1, &n))
+            if (rec.EventType == KEY_EVENT && rec.Event.KeyEvent.bKeyDown) break;
+    } else {
+        Sleep(2500);
+    }
+    return code;
+}
+
+static bool RunAndWait(const std::wstring& exe, std::wstring cmdline, DWORD* exitCode = nullptr) {
+    STARTUPINFOW si{sizeof(si)};
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(exe.empty() ? nullptr : exe.c_str(), cmdline.data(), nullptr, nullptr, FALSE, 0, nullptr,
+                        nullptr, &si, &pi))
+        return false;
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    if (exitCode) GetExitCodeProcess(pi.hProcess, exitCode);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return true;
+}
+
+static bool Start(const std::wstring& exe, std::wstring cmdline, DWORD flags = 0) {
+    STARTUPINFOW si{sizeof(si)};
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(exe.empty() ? nullptr : exe.c_str(), cmdline.data(), nullptr, nullptr, FALSE, flags, nullptr,
+                        nullptr, &si, &pi))
+        return false;
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return true;
+}
+
+static std::wstring Quote(const std::wstring& s) { return L"\"" + s + L"\""; }
+
+static int UpdateDia(bool relaunch) {
+    wprintf(L"Checking for a new Dia...\n");
+    DiaVersion d = CheckDia();
+    if (d.latest.empty()) {
+        fwprintf(stderr, L"Couldn't check for Dia updates: %ls\n", d.error.c_str());
+        return 1;
+    }
+    if (!Newer(d.latest, d.installed)) {
+        wprintf(L"Dia %ls is up to date.\n", d.installed.c_str());
+        return 0;
+    }
+    wprintf(L"Updating Dia %ls to %ls. Dia closes while it installs.\n", d.installed.c_str(), d.latest.c_str());
+    CloseDia();
+    try {
+        wdm::PackageManager pm;
+        auto op = pm.AddPackageByAppInstallerFileAsync(Uri(d.feed), wdm::AddPackageByAppInstallerOptions::ForceTargetAppShutdown,
+                                                       pm.GetDefaultPackageVolume());
+        op.Progress([](auto&&, wdm::DeploymentProgress const& p) { wprintf(L"\r  %3u%%", p.percentage); });
+        auto result = op.get();
+        wprintf(L"\n");
+        if (result.ExtendedErrorCode() < 0) {
+            fwprintf(stderr, L"Dia didn't update: %ls\n", std::wstring(result.ErrorText()).c_str());
+            if (relaunch) StartTweaked(true);
+            return 1;
+        }
+    } catch (winrt::hresult_error const& e) {
+        fwprintf(stderr, L"\nDia didn't update: %ls\n", Message(e).c_str());
+        if (relaunch) StartTweaked(true);
+        return 1;
+    }
+    wprintf(L"Dia updated to %ls.\n", d.latest.c_str());
+    if (relaunch && !StartTweaked(false)) return 1;
+    return 0;
+}
+
+// Installing replaces this program, so the last step always runs in another process: `install` from
+// the downloaded release, or cmd for a clone. Returns once that process is started (handedOff), which
+// reopens Dia when it's done.
+static int UpdateTweaks(bool force, bool* handedOff = nullptr) {
+    wprintf(L"Checking for a new WinDiaTweaks...\n");
+    Release r = LatestRelease();
+    if (r.tag.empty()) {
+        fwprintf(stderr, L"Couldn't check for WinDiaTweaks updates: %ls\n", r.error.c_str());
+        return 1;
+    }
+    if (!force && !Newer(r.tag, WDT_VERSION)) {
+        wprintf(L"WinDiaTweaks %ls is up to date.\n", WDT_VERSION);
+        return 0;
+    }
+    std::wstring root = RepoRoot();
+    if (!root.empty()) {
+        wprintf(L"Updating WinDiaTweaks in %ls to %ls with git, then rebuilding it.\n", root.c_str(), r.tag.c_str());
+        CloseDia();  // a DLL Dia has loaded can't be rebuilt
+        std::wstring cmd = L"cmd.exe /d /c \"timeout /t 1 /nobreak >nul & cd /d " + Quote(root) +
+                           L" && git pull --ff-only && call install.cmd /update || pause\"";
+        if (!Start(L"", cmd)) {
+            fwprintf(stderr, L"Couldn't run git (error %lu).\n", GetLastError());
+            return 1;
+        }
+        if (handedOff) *handedOff = true;
+        return 0;
+    }
+    if (r.zip.empty()) {
+        fwprintf(stderr, L"Release %ls has no %ls to install.\n", r.tag.c_str(), kZip);
+        return 1;
+    }
+    std::wstring dir = g_dir + L"\\update";
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::create_directories(dir + L"\\new", ec);
+    wprintf(L"Downloading WinDiaTweaks %ls...\n", r.tag.c_str());
+    std::wstring err, zip = dir + L"\\" + kZip;
+    if (!Download(r.zip, zip, err)) {
+        fwprintf(stderr, L"Download failed: %ls\n", err.c_str());
+        return 1;
+    }
+    wchar_t sys[MAX_PATH];
+    GetSystemDirectoryW(sys, MAX_PATH);
+    std::wstring tar = std::wstring(sys) + L"\\tar.exe";
+    DWORD code = 1;
+    if (!RunAndWait(tar, Quote(tar) + L" -xf " + Quote(zip) + L" -C " + Quote(dir + L"\\new"), &code) || code ||
+        GetFileAttributesW((dir + L"\\new\\diatweaks.exe").c_str()) == INVALID_FILE_ATTRIBUTES) {
+        fwprintf(stderr, L"Couldn't unpack %ls.\n", zip.c_str());
+        return 1;
+    }
+    std::wstring next = dir + L"\\new\\diatweaks.exe";
+    if (!Start(next, Quote(next) + L" install --to " + Quote(g_dir) + L" --wait " + std::to_wstring(GetCurrentProcessId()))) {
+        fwprintf(stderr, L"Couldn't start the new version (error %lu).\n", GetLastError());
+        return 1;
+    }
+    if (handedOff) *handedOff = true;
+    return 0;
+}
+
+static int CmdUpdate(const std::wstring& what) {
+    if (what == L"dia") return UpdateDia(true);
+    if (what == L"tweaks" || what == L"windiatweaks") return UpdateTweaks(false);
+    if (what == L"tweaks-force") return UpdateTweaks(true);
+    // Both: Dia first without reopening it, as installing WinDiaTweaks reopens it anyway.
+    bool wasOpen = FindDiaUiPid() != 0, handedOff = false;
+    int a = UpdateDia(false);
+    int b = UpdateTweaks(false, &handedOff);
+    if (!handedOff && wasOpen && !FindDiaUiPid()) StartTweaked(false);
+    return a | b;
+}
+
+// tweaks.conf holds the tweak definitions and your choices. Takes a newer file's definitions and puts
+// each tweak's on/off and value from the old one back in.
+static std::vector<std::string> MergeConf(const std::vector<std::string>& fresh, const std::vector<std::string>& mine) {
+    auto header = [](const std::string& l, std::string& key, std::string& rest) {
+        size_t a = l.find_first_not_of(" \t");
+        if (a == std::string::npos || l[a] != '[') return false;
+        size_t e = l.find(']', a);
+        if (e == std::string::npos) return false;
+        key = l.substr(a + 1, e - a - 1);
+        rest = l.substr(e + 1);
+        rest.erase(0, rest.find_first_not_of(" \t"));
+        rest.erase(rest.find_last_not_of(" \t") + 1);
+        return true;
+    };
+    auto isValue = [](const std::string& l) {
+        size_t a = l.find_first_not_of(" \t");
+        return a != std::string::npos && l.compare(a, 6, "value:") == 0;
+    };
+    std::map<std::string, std::string> state, value;
+    std::string key, rest;
+    for (auto& l : mine) {
+        if (header(l, key, rest)) state[key] = rest;
+        else if (!key.empty() && isValue(l)) value[key] = l;
+    }
+    std::vector<std::string> out;
+    key.clear();
+    for (auto& l : fresh) {
+        std::string k;
+        if (header(l, k, rest)) {
+            key = k;
+            out.push_back(state.count(k) ? "[" + k + "] " + state[k] : l);
+        } else if (!key.empty() && isValue(l) && value.count(key)) {
+            out.push_back(value[key]);
+        } else {
+            out.push_back(l);
+        }
+    }
+    return out;
+}
+
+static std::vector<std::string> ReadFileLines(const std::wstring& path) {
+    std::vector<std::string> lines;
+    std::ifstream in(path);
+    std::string l;
+    while (std::getline(in, l)) {
+        if (!l.empty() && l.back() == '\r') l.pop_back();
+        lines.push_back(l);
+    }
+    return lines;
+}
+
+static bool MergeConfFiles(const std::wstring& fresh, const std::wstring& mine) {
+    auto a = ReadFileLines(fresh), b = ReadFileLines(mine);
+    if (a.empty()) return false;
+    auto merged = b.empty() ? a : MergeConf(a, b);
+    std::ofstream out(mine, std::ios::binary);
+    for (auto& l : merged) out << l << "\n";
+    return out.good();
+}
+
+static bool CreateShortcut(const std::wstring& target) {
+    PWSTR programs = nullptr;
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_Programs, 0, nullptr, &programs))) return false;
+    std::wstring lnk = std::wstring(programs) + L"\\Dia (Tweaks).lnk";
+    CoTaskMemFree(programs);
+    IShellLinkW* link = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&link)))) return false;
+    link->SetPath(target.c_str());
+    link->SetWorkingDirectory(target.substr(0, target.find_last_of(L'\\')).c_str());
+    link->SetDescription(L"Open Dia with WinDiaTweaks");
+    link->SetShowCmd(SW_SHOWMINNOACTIVE);
+    IPersistFile* file = nullptr;
+    bool ok = SUCCEEDED(link->QueryInterface(IID_PPV_ARGS(&file))) && SUCCEEDED(file->Save(lnk.c_str(), TRUE));
+    if (file) file->Release();
+    link->Release();
+    return ok;
+}
+
+// Copy, or when the file is in use (a DLL Dia still has loaded) move it aside first.
+static bool Replace(const std::wstring& from, const std::wstring& to) {
+    for (int i = 0; i < 20; i++) {
+        if (CopyFileW(from.c_str(), to.c_str(), FALSE)) return true;
+        std::wstring old = to + L".old";
+        DeleteFileW(old.c_str());
+        if (MoveFileExW(to.c_str(), old.c_str(), MOVEFILE_REPLACE_EXISTING) && CopyFileW(from.c_str(), to.c_str(), FALSE))
+            return true;
+        Sleep(250);
+    }
+    return false;
+}
+
+// `install [--to <folder>] [--wait <pid>]`: puts this copy of WinDiaTweaks (an unpacked release) in
+// place, keeping the choices in the old tweaks.conf, then opens Dia with it. Default folder:
+// %USERPROFILE%\WinDiaTweaks\bin (not AppData: Dia's writes to AppData would be redirected into its
+// package, out of sight of this program).
+static int CmdInstall(int argc, wchar_t** argv) {
+    std::wstring to;
+    DWORD wait = 0;
+    for (int i = 2; i + 1 < argc; i++) {
+        if (Lower(argv[i]) == L"--to") to = argv[++i];
+        else if (Lower(argv[i]) == L"--wait") wait = wcstoul(argv[++i], nullptr, 10);
+    }
+    if (to.empty()) {
+        wchar_t home[MAX_PATH];
+        if (!GetEnvironmentVariableW(L"USERPROFILE", home, MAX_PATH)) return 1;
+        to = std::wstring(home) + L"\\WinDiaTweaks\\bin";
+    }
+    while (!to.empty() && (to.back() == L'\\' || to.back() == L'/')) to.pop_back();
+    if (wait)
+        if (HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, wait)) WaitForSingleObject(h, 30000), CloseHandle(h);
+    if (_wcsicmp(to.c_str(), g_dir.c_str()) == 0) {
+        fwprintf(stderr, L"Already installed in %ls.\n", to.c_str());
+        return 1;
+    }
+    wprintf(L"Installing WinDiaTweaks %ls in %ls...\n", WDT_VERSION, to.c_str());
+    SHCreateDirectoryExW(nullptr, to.c_str(), nullptr);
+    CloseDia();
+    for (const wchar_t* name : {L"diatweaks.exe", L"DiaTweaksTap.dll", L"uninstall.cmd", L"LICENSE"}) {
+        std::wstring from = g_dir + L"\\" + name;
+        if (GetFileAttributesW(from.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+        if (!Replace(from, to + L"\\" + name)) {
+            fwprintf(stderr, L"Couldn't replace %ls\\%ls (error %lu). Close Dia and try again.\n", to.c_str(), name,
+                     GetLastError());
+            return 1;
+        }
+    }
+    if (!MergeConfFiles(g_dir + L"\\tweaks.conf", to + L"\\tweaks.conf")) {
+        fwprintf(stderr, L"Couldn't write %ls\\tweaks.conf.\n", to.c_str());
+        return 1;
+    }
+    if (!CreateShortcut(to + L"\\diatweaks.exe")) fwprintf(stderr, L"Couldn't add \"Dia (Tweaks)\" to the Start menu.\n");
+    wprintf(L"Opening Dia with WinDiaTweaks %ls...\n", WDT_VERSION);
+    std::wstring exe = to + L"\\diatweaks.exe";
+    DWORD code = 1;
+    RunAndWait(exe, Quote(exe) + L" restart", &code);
+    if (!code) wprintf(L"Done. Open Dia from \"Dia (Tweaks)\" in the Start menu from now on.\n");
+    return (int)code;
+}
+
+// `detach <command...>`: runs diatweaks <command...> in its own console window, outside Dia. Settings
+// starts updates this way: Dia's package would otherwise own the process (and close it with Dia).
+static int CmdDetach(int argc, wchar_t** argv) {
+    wchar_t self[MAX_PATH];
+    GetModuleFileNameW(nullptr, self, MAX_PATH);
+    std::wstring cmd = Quote(self);
+    for (int i = 2; i < argc; i++) cmd += L" " + Quote(argv[i]);
+    return Start(self, cmd, CREATE_NEW_CONSOLE) ? 0 : 1;
+}
+
+// Left behind by an earlier update: a replaced file still in use, and the unpacked release.
+static void CleanUpAfterUpdate() {
+    for (const wchar_t* name : {L"diatweaks.exe.old", L"DiaTweaksTap.dll.old"}) DeleteFileW((g_dir + L"\\" + name).c_str());
+    std::error_code ec;
+    std::filesystem::remove_all(g_dir + L"\\update", ec);
+}
+
 static void Usage() {
     wprintf(
-        L"DiaTweaks for Windows (unofficial)\n\n"
+        L"WinDiaTweaks " WDT_VERSION L" (unofficial)\n\n"
         L"  diatweaks                 start Dia with tweaks (or reload if already tweaked)\n"
         L"  diatweaks restart         close Dia and start it again with tweaks\n"
         L"  diatweaks list            show tweaks and whether they're on\n"
@@ -464,7 +1016,10 @@ static void Usage() {
         L"  diatweaks status          Dia process + tweak state\n"
         L"  diatweaks set <name> <v>  set a tweak's option (e.g. set windowMaterial acrylic)\n"
         L"  diatweaks dump            write Dia's UI tree to tree.txt (for making tweaks)\n"
-        L"  diatweaks probe <names>   describe live elements by name (for making tweaks)\n\n"
+        L"  diatweaks probe <names>   describe live elements by name (for making tweaks)\n"
+        L"  diatweaks check           show installed and newest versions of Dia and WinDiaTweaks\n"
+        L"  diatweaks update [what]   install updates: dia, tweaks, or both (the default)\n"
+        L"  diatweaks version         show this WinDiaTweaks version\n\n"
         L"Every tweak can also be switched in Dia: Settings > Patches.\n"
         L"Tweaks that are on apply the moment Dia starts, and live-reload on enable/disable.\n");
 }
@@ -474,9 +1029,18 @@ int wmain(int argc, wchar_t** argv) {
     GetModuleFileNameW(nullptr, self, MAX_PATH);
     g_dir = self;
     g_dir = g_dir.substr(0, g_dir.find_last_of(L'\\'));
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-
     std::wstring cmd = argc > 1 ? Lower(argv[1]) : L"apply";
+    // Update commands wait on WinRT calls, which must not block a single-threaded apartment.
+    bool winrtCmd = cmd == L"check" || cmd == L"update" || cmd == L"install";
+    CoInitializeEx(nullptr, winrtCmd ? COINIT_MULTITHREADED : COINIT_APARTMENTTHREADED);
+
+    if (cmd == L"version" || cmd == L"--version") return wprintf(L"%ls\n", WDT_VERSION), 0;
+    if (cmd == L"check") return CmdCheck();
+    if (cmd == L"update") return Finish(CmdUpdate(argc > 2 ? Lower(argv[2]) : L"all"));
+    if (cmd == L"install") return Finish(CmdInstall(argc, argv));
+    if (cmd == L"detach" && argc > 2) return CmdDetach(argc, argv);
+    if (cmd == L"merge-conf" && argc > 3) return MergeConfFiles(argv[2], argv[3]) ? 0 : 1;
+    if (cmd == L"apply" || cmd == L"launch" || cmd == L"restart") CleanUpAfterUpdate();
     if (cmd == L"apply") return CmdApply();
     if (cmd == L"launch" || cmd == L"restart") return StartTweaked(false) ? 0 : 1;
     if (cmd == L"list") return ListTweaks(), 0;

@@ -1,0 +1,60 @@
+name: Release
+
+# Push a tag like v1.2.0 to publish a release: it builds WinDiaTweaks.zip (prebuilt, no Visual Studio
+# needed to install it) and writes the notes that Dia > Settings > Patches > Updates shows.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build again (replaces its WinDiaTweaks.zip)
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+      # No Dia on the runner: build against the same WinUI metadata from NuGet.
+      WDT_WINMD: nuget
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+          fetch-depth: 0
+
+      - name: Build
+        shell: cmd
+        run: |
+          set "WDT_VERSION=%TAG%"
+          call build.cmd
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $files = New-Item -ItemType Directory -Force dist/files
+          Copy-Item bin/diatweaks.exe, bin/DiaTweaksTap.dll, tweaks.conf, uninstall.cmd, LICENSE $files
+          Compress-Archive -Path "$files/*" -DestinationPath dist/WinDiaTweaks.zip -Force
+          Copy-Item scripts/install.ps1 dist/install.ps1
+          & bin/diatweaks.exe version
+
+      - name: Write release notes
+        shell: bash
+        run: |
+          git fetch --force --tags  # checkout leaves the tag lightweight, which loses its message
+          scripts/release-notes.sh "$TAG" > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+
+      - name: Publish
+        shell: bash
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/WinDiaTweaks.zip dist/install.ps1 --clobber
+          else
+            gh release create "$TAG" dist/WinDiaTweaks.zip dist/install.ps1 --verify-tag --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
+          fi
