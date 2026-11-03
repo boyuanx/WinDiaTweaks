@@ -5,3 +5,7 @@ static const CLSID CLSID_DiaTweaksTap = {0x7a1c3f52, 0x9b4e, 0x4d2a, {0x8f, 0x61
 #define DT_EVENT_RELOAD L"Local\\DiaTweaksWin_Reload"
 #define DT_EVENT_DUMP   L"Local\\DiaTweaksWin_Dump"
 #define DT_EVENT_DONE   L"Local\\DiaTweaksWin_Done"
+// Followed by Dia's pid. ATTACHED is set once the add-on is attached to Dia's UI; RETRY asks an add-on
+// that loaded but couldn't attach to try again.
+#define DT_EVENT_ATTACHED L"Local\\DiaTweaksWin_Attached_"
+#define DT_EVENT_RETRY    L"Local\\DiaTweaksWin_Retry_"

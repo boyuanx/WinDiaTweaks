@@ -210,37 +210,45 @@ static bool InjectTap(DWORD pid) {
         return false;
     }
     for (int i = 0; i < 60 && !TapLoaded(pid); i++) Sleep(100);
-    return TapLoaded(pid);
+    if (TapLoaded(pid)) return true;
+    fwprintf(stderr, L"The add-on didn't stay loaded in Dia (pid %lu). See %ls\\tap.log\n", pid, g_dir.c_str());
+    return false;
 }
 
 static const wchar_t kDiaAppId[] = L"TheBrowserCompany.Dia_ttt1ap7aakyb4!Dia";
 
-// Activate Dia the way the Start menu does. Returns the pid it started or brought forward (0 on failure).
-// With Dia already open, Dia handles it like a click on its own icon.
-static DWORD ActivateDia() {
+// Activate Dia the way the Start menu does; *pid gets the process it started or brought forward. With
+// Dia already open, Dia handles it like a click on its own icon.
+static bool ActivateDia(DWORD* pid = nullptr) {
     IApplicationActivationManager* am = nullptr;
     if (FAILED(CoCreateInstance(CLSID_ApplicationActivationManager, nullptr, CLSCTX_LOCAL_SERVER, IID_PPV_ARGS(&am))))
-        return 0;
+        return false;
     AllowSetForegroundWindow(ASFW_ANY);  // pass on the click that started us, so Dia comes to the front
-    DWORD pid = 0;
-    if (FAILED(am->ActivateApplication(kDiaAppId, nullptr, AO_NONE, &pid))) pid = 0;
+    DWORD started = 0;
+    bool ok = SUCCEEDED(am->ActivateApplication(kDiaAppId, nullptr, AO_NONE, &started));
     am->Release();
-    return pid;
+    if (pid) *pid = ok ? started : 0;
+    return ok;
+}
+
+// The same through the shell (shell:AppsFolder), for when activation fails.
+static bool OpenDiaViaShell() {
+    HINSTANCE h = ShellExecuteW(nullptr, L"open", L"explorer.exe",
+                                (std::wstring(L"shell:AppsFolder\\") + kDiaAppId).c_str(), nullptr, SW_SHOWNORMAL);
+    return (INT_PTR)h > 32;
 }
 
 // Start Dia the normal way: through the package's own activation path, so it comes up exactly as the
 // user expects. Dia hands its UI off to a broker-launched process, so environment variables can't be
-// passed in - the add-on is attached as Dia starts instead. Returns Dia's pid when known.
+// passed in - the add-on is attached as Dia starts instead. *pid gets Dia's pid when known.
 static bool LaunchTweaked(DWORD* pid) {
-    if ((*pid = ActivateDia())) return true;
+    if (ActivateDia(pid)) return true;
     std::wstring exe = DiaExePath();
     if (exe.empty()) {
         fwprintf(stderr, L"Can't find Dia's location. Open Dia once (normally), then run this again.\n");
         return false;
     }
-    HINSTANCE h = ShellExecuteW(nullptr, L"open", L"explorer.exe",
-                                (std::wstring(L"shell:AppsFolder\\") + kDiaAppId).c_str(), nullptr, SW_SHOWNORMAL);
-    if ((INT_PTR)h > 32) return true;
+    if (OpenDiaViaShell()) return true;
 
     std::wstring cwd = exe.substr(0, exe.find_last_of(L'\\'));
     STARTUPINFOW si{sizeof(si)};
@@ -261,6 +269,34 @@ static bool LaunchTweaked(DWORD* pid) {
 static void Signal(LPCWSTR name) {
     HANDLE ev = OpenEventW(EVENT_MODIFY_STATE, FALSE, name);
     if (ev) SetEvent(ev), CloseHandle(ev);
+}
+
+static std::wstring PidEvent(LPCWSTR name, DWORD pid) { return name + std::to_wstring(pid); }
+
+// Whether the add-on in this Dia is attached to its UI, not just loaded: it sets this event once WinUI
+// hands it the visual tree.
+static bool TapAttached(DWORD pid) {
+    HANDLE ev = OpenEventW(SYNCHRONIZE, FALSE, PidEvent(DT_EVENT_ATTACHED, pid).c_str());
+    if (!ev) return false;
+    bool set = WaitForSingleObject(ev, 0) == WAIT_OBJECT_0;
+    CloseHandle(ev);
+    return set;
+}
+
+// Get the tweaks attached to this Dia: load the add-on if it isn't there, ask it to try again if it's
+// there but couldn't attach, then wait until it says it's attached.
+static bool EnsureTweaked(DWORD pid, int seconds) {
+    if (!TapLoaded(pid)) {
+        if (!InjectTap(pid)) return false;
+    } else if (!TapAttached(pid)) {
+        Signal(PidEvent(DT_EVENT_RETRY, pid).c_str());
+    }
+    for (ULONGLONG end = GetTickCount64() + seconds * 1000ull; GetTickCount64() < end;) {
+        if (TapAttached(pid)) return true;
+        Sleep(10);
+    }
+    fwprintf(stderr, L"The add-on is in Dia but the tweaks didn't attach. See %ls\\tap.log\n", g_dir.c_str());
+    return false;
 }
 
 // ---------------------------------------------------------------- config
@@ -352,7 +388,7 @@ static int SetTweak(const std::wstring& which, bool on) {
 static DWORD WaitForTap(int seconds) {
     for (int i = 0; i < seconds * 4; i++) {
         DWORD p = FindDiaUiPid();
-        if (p && TapLoaded(p)) return p;
+        if (p && TapAttached(p)) return p;
         Sleep(250);
     }
     return 0;
@@ -390,7 +426,7 @@ static DWORD StartTweaked(bool quiet) {
     // Attach right as Dia's main process starts, not once its window shows: the add-on then waits for
     // WinUI inside Dia and the tweaks are in place before the first frame, so plain Dia never flashes.
     if (pid && FindDiaMainPid() != pid) pid = 0;
-    for (int i = 0; i < 4000 && !pid; i++) {  // up to 40 s
+    for (ULONGLONG end = GetTickCount64() + 40000; !pid && GetTickCount64() < end;) {
         pid = FindDiaMainPid();
         if (!pid) Sleep(10);
     }
@@ -411,9 +447,14 @@ static DWORD StartTweaked(bool quiet) {
 
 static int CmdApply() {
     DWORD pid = FindDiaUiPid();
-    if (pid && TapLoaded(pid)) {
+    if (pid && TapAttached(pid)) {
         Signal(DT_EVENT_RELOAD);
         wprintf(L"Tweaks reloaded in Dia (pid %lu)\n", pid);
+        return 0;
+    }
+    if (pid && TapLoaded(pid)) {  // loaded but never attached: have it try again
+        if (!EnsureTweaked(pid, 15)) return 1;
+        wprintf(L"Dia running with tweaks (pid %lu)\n", pid);
         return 0;
     }
     return StartTweaked(false) ? 0 : 1;
@@ -1021,13 +1062,17 @@ static bool CreateShortcut(const std::wstring& target) {
 
 // What the shortcut runs (DiaLauncher.exe, no console window): open Dia with the tweaks, like Dia's own
 // icon would. Already open with them: Dia handles it as a click on its icon. Open without them: they're
-// added to it in place, nothing is closed.
+// added to it in place, nothing is closed. Fails (so the launcher says so) if the tweaks don't attach or
+// Dia can't be brought forward.
 static int CmdOpen() {
     DWORD pid = FindDiaMainPid();
     if (!pid) return StartTweaked(true) ? 0 : 1;
-    if (!TapLoaded(pid) && !InjectTap(pid)) return 1;
-    ActivateDia();
-    return 0;
+    bool tweaked = EnsureTweaked(pid, 15);
+    if (!ActivateDia() && !OpenDiaViaShell()) {  // still show Dia, even when the tweaks failed
+        fwprintf(stderr, L"Couldn't bring Dia to the front.\n");
+        return 1;
+    }
+    return tweaked ? 0 : 1;
 }
 
 // Copy, or when the file is in use (a DLL Dia still has loaded) move it aside first.
