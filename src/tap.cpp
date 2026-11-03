@@ -1059,19 +1059,21 @@ typedef HRESULT(WINAPI* PFN_InitXamlDiag)(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, CLSI
 // the Tap (via DllGetClassObject) and hand it IXamlDiagnostics. This is the in-process entry the API
 // is designed for; it just needs code running in Dia, which the one-time loader provides.
 static DWORD WINAPI Bootstrap(LPVOID) {
+    // diatweaks loads us the moment Dia starts, before WinUI: poll often, so we attach before Dia's
+    // window first shows and its UI comes up already tweaked.
     HMODULE udk = nullptr;
-    for (int i = 0; i < 150 && !udk; i++) {
+    for (int i = 0; i < 4000 && !udk; i++) {  // up to 40 s
         udk = GetModuleHandleW(L"Microsoft.Internal.FrameworkUdk.dll");
-        if (!udk) Sleep(100);
+        if (!udk) Sleep(10);
     }
     if (!udk) return Log("FrameworkUdk not present in this process"), 1;
     auto init = (PFN_InitXamlDiag)GetProcAddress(udk, "InitializeXamlDiagnosticsEx");
     if (!init) return Log("InitializeXamlDiagnosticsEx not found"), 1;
     // Wait for the WinUI framework dll to be loaded in this process.
     HMODULE xaml = nullptr;
-    for (int i = 0; i < 150 && !xaml; i++) {
+    for (int i = 0; i < 4000 && !xaml; i++) {
         xaml = GetModuleHandleW(L"Microsoft.ui.xaml.dll");
-        if (!xaml) Sleep(100);
+        if (!xaml) Sleep(10);
     }
     if (!xaml) return Log("Microsoft.ui.xaml.dll not present in this process"), 1;
 
@@ -1089,16 +1091,20 @@ static DWORD WINAPI Bootstrap(LPVOID) {
     // "VisualDiagConnection1" is the old UWP (Windows.UI.Xaml) name.
     const wchar_t* kDiagDlls[] = {xamlPath, L"Microsoft.ui.xaml.dll"};
 
+    // Early in Dia's start the endpoint may not answer yet: keep probing until it does.
     HRESULT hr = E_FAIL;
-    for (int n = -1; n < 8; n++) {
-        std::wstring ep = L"WinUIVisualDiagConnection";
-        if (n >= 0) ep += std::to_wstring(n);
-        for (auto dll : kDiagDlls) {
-            if (g_diag) return Log("already attached via SetSite; stopping probe"), 0;
-            hr = init(ep.c_str(), GetCurrentProcessId(), dll, tapPath, CLSID_DiaTweaksTap, L"");
-            Log("probe ep=%ls diagDll=%ls -> 0x%08lx", ep.c_str(), dll, hr);
-            if (SUCCEEDED(hr)) return Log("attached via ep=%ls", ep.c_str()), 0;
+    for (int round = 0; round < 1500; round++) {  // up to ~30 s
+        for (int n = -1; n < 8; n++) {
+            std::wstring ep = L"WinUIVisualDiagConnection";
+            if (n >= 0) ep += std::to_wstring(n);
+            for (auto dll : kDiagDlls) {
+                if (g_diag) return Log("already attached via SetSite; stopping probe"), 0;
+                hr = init(ep.c_str(), GetCurrentProcessId(), dll, tapPath, CLSID_DiaTweaksTap, L"");
+                if (!round) Log("probe ep=%ls diagDll=%ls -> 0x%08lx", ep.c_str(), dll, hr);
+                if (SUCCEEDED(hr)) return Log("attached via ep=%ls (probe round %d)", ep.c_str(), round), 0;
+            }
         }
+        Sleep(20);
     }
     Log("in-process InitializeXamlDiagnosticsEx failed everywhere, last 0x%08lx", hr);
     return 0;

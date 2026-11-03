@@ -81,6 +81,20 @@ static DWORD FindDiaUiPid() {
     return 0;
 }
 
+// Dia's main (browser) process: the Dia.exe not started by another Dia.exe (those are its helper
+// processes). It exists from the first moment Dia starts, long before its window shows.
+static DWORD FindDiaMainPid() {
+    std::map<DWORD, DWORD> dia;  // pid -> parent
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    PROCESSENTRY32W pe{sizeof(pe)};
+    for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe))
+        if (_wcsicmp(pe.szExeFile, L"Dia.exe") == 0) dia[pe.th32ProcessID] = pe.th32ParentProcessID;
+    CloseHandle(snap);
+    for (auto& [pid, parent] : dia)
+        if (!dia.count(parent)) return pid;
+    return 0;
+}
+
 static std::wstring ProcessPath(DWORD pid) {
     HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (!h) return {};
@@ -199,18 +213,33 @@ static bool InjectTap(DWORD pid) {
     return TapLoaded(pid);
 }
 
+static const wchar_t kDiaAppId[] = L"TheBrowserCompany.Dia_ttt1ap7aakyb4!Dia";
+
+// Activate Dia the way the Start menu does. Returns the pid it started or brought forward (0 on failure).
+// With Dia already open, Dia handles it like a click on its own icon.
+static DWORD ActivateDia() {
+    IApplicationActivationManager* am = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_ApplicationActivationManager, nullptr, CLSCTX_LOCAL_SERVER, IID_PPV_ARGS(&am))))
+        return 0;
+    AllowSetForegroundWindow(ASFW_ANY);  // pass on the click that started us, so Dia comes to the front
+    DWORD pid = 0;
+    if (FAILED(am->ActivateApplication(kDiaAppId, nullptr, AO_NONE, &pid))) pid = 0;
+    am->Release();
+    return pid;
+}
+
 // Start Dia the normal way: through the package's own activation path, so it comes up exactly as the
 // user expects. Dia hands its UI off to a broker-launched process, so environment variables can't be
-// passed in - the add-on is attached once Dia is up instead.
-static bool LaunchTweaked() {
+// passed in - the add-on is attached as Dia starts instead. Returns Dia's pid when known.
+static bool LaunchTweaked(DWORD* pid) {
+    if ((*pid = ActivateDia())) return true;
     std::wstring exe = DiaExePath();
     if (exe.empty()) {
         fwprintf(stderr, L"Can't find Dia's location. Open Dia once (normally), then run this again.\n");
         return false;
     }
     HINSTANCE h = ShellExecuteW(nullptr, L"open", L"explorer.exe",
-                                L"shell:AppsFolder\\TheBrowserCompany.Dia_ttt1ap7aakyb4!Dia", nullptr,
-                                SW_SHOWNORMAL);
+                                (std::wstring(L"shell:AppsFolder\\") + kDiaAppId).c_str(), nullptr, SW_SHOWNORMAL);
     if ((INT_PTR)h > 32) return true;
 
     std::wstring cwd = exe.substr(0, exe.find_last_of(L'\\'));
@@ -355,12 +384,15 @@ static void CloseDia() {
 // Start a tweaked Dia, closing any plain instance first. Returns the tapped pid (0 on failure).
 static DWORD StartTweaked(bool quiet) {
     CloseDia();
-    if (!LaunchTweaked()) return 0;
-
     DWORD pid = 0;
-    for (int i = 0; i < 160 && !pid; i++) {
-        Sleep(250);
-        pid = FindDiaUiPid();
+    if (!LaunchTweaked(&pid)) return 0;
+
+    // Attach right as Dia's main process starts, not once its window shows: the add-on then waits for
+    // WinUI inside Dia and the tweaks are in place before the first frame, so plain Dia never flashes.
+    if (pid && FindDiaMainPid() != pid) pid = 0;
+    for (int i = 0; i < 4000 && !pid; i++) {  // up to 40 s
+        pid = FindDiaMainPid();
+        if (!pid) Sleep(10);
     }
     if (!pid) {
         fwprintf(stderr, L"Dia didn't come up. Try opening Dia yourself, then run: diatweaks\n");
@@ -980,12 +1012,22 @@ static bool CreateShortcut(const std::wstring& target) {
     link->SetPath(target.c_str());
     link->SetWorkingDirectory(target.substr(0, target.find_last_of(L'\\')).c_str());
     link->SetDescription(L"Open Dia with WinDiaTweaks");
-    link->SetShowCmd(SW_SHOWMINNOACTIVE);
     IPersistFile* file = nullptr;
     bool ok = SUCCEEDED(link->QueryInterface(IID_PPV_ARGS(&file))) && SUCCEEDED(file->Save(lnk.c_str(), TRUE));
     if (file) file->Release();
     link->Release();
     return ok;
+}
+
+// What the shortcut runs (DiaLauncher.exe, no console window): open Dia with the tweaks, like Dia's own
+// icon would. Already open with them: Dia handles it as a click on its icon. Open without them: they're
+// added to it in place, nothing is closed.
+static int CmdOpen() {
+    DWORD pid = FindDiaMainPid();
+    if (!pid) return StartTweaked(true) ? 0 : 1;
+    if (!TapLoaded(pid) && !InjectTap(pid)) return 1;
+    ActivateDia();
+    return 0;
 }
 
 // Copy, or when the file is in use (a DLL Dia still has loaded) move it aside first.
@@ -1027,7 +1069,7 @@ static int CmdInstall(int argc, wchar_t** argv) {
     wprintf(L"Installing WinDiaTweaks %ls in %ls...\n", WDT_VERSION, to.c_str());
     SHCreateDirectoryExW(nullptr, to.c_str(), nullptr);
     CloseDia();
-    for (const wchar_t* name : {L"diatweaks.exe", L"DiaTweaksTap.dll", L"auto-attach.ps1", L"uninstall.cmd", L"LICENSE"}) {
+    for (const wchar_t* name : {L"diatweaks.exe", L"DiaLauncher.exe", L"DiaTweaksTap.dll", L"auto-attach.ps1", L"uninstall.cmd", L"LICENSE"}) {
         std::wstring from = g_dir + L"\\" + name;
         if (GetFileAttributesW(from.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
         if (!Replace(from, to + L"\\" + name)) {
@@ -1040,7 +1082,9 @@ static int CmdInstall(int argc, wchar_t** argv) {
         fwprintf(stderr, L"Couldn't write %ls\\tweaks.conf.\n", to.c_str());
         return 1;
     }
-    if (!CreateShortcut(to + L"\\diatweaks.exe")) fwprintf(stderr, L"Couldn't add \"Dia (Tweaks)\" to the Start menu.\n");
+    std::wstring launcher = to + L"\\DiaLauncher.exe";
+    if (GetFileAttributesW(launcher.c_str()) == INVALID_FILE_ATTRIBUTES) launcher = to + L"\\diatweaks.exe";
+    if (!CreateShortcut(launcher)) fwprintf(stderr, L"Couldn't add \"Dia (Tweaks)\" to the Start menu.\n");
     wprintf(L"Opening Dia with WinDiaTweaks %ls...\n", WDT_VERSION);
     std::wstring exe = to + L"\\diatweaks.exe";
     DWORD code = 1;
@@ -1061,7 +1105,7 @@ static int CmdDetach(int argc, wchar_t** argv) {
 
 // Left behind by an earlier update: a replaced file still in use, and the unpacked release.
 static void CleanUpAfterUpdate() {
-    for (const wchar_t* name : {L"diatweaks.exe.old", L"DiaTweaksTap.dll.old"}) DeleteFileW((g_dir + L"\\" + name).c_str());
+    for (const wchar_t* name : {L"diatweaks.exe.old", L"DiaLauncher.exe.old", L"DiaTweaksTap.dll.old"}) DeleteFileW((g_dir + L"\\" + name).c_str());
     std::error_code ec;
     std::filesystem::remove_all(g_dir + L"\\update", ec);
 }
@@ -1096,6 +1140,19 @@ int wmain(int argc, wchar_t** argv) {
     bool winrtCmd = cmd == L"check" || cmd == L"update" || cmd == L"install";
     CoInitializeEx(nullptr, winrtCmd ? COINIT_MULTITHREADED : COINIT_APARTMENTTHREADED);
 
+#ifdef WDT_LAUNCHER
+    // DiaLauncher.exe: no console. Says what went wrong in a message box, as nothing shows its output.
+    if (argc < 2) {
+        CleanUpAfterUpdate();
+        int r = CmdOpen();
+        if (r)
+            MessageBoxW(nullptr,
+                        L"Dia didn't open with WinDiaTweaks. For details, run diatweaks in PowerShell from this "
+                        L"folder, or see tap.log in it.",
+                        L"WinDiaTweaks", MB_OK | MB_ICONWARNING);
+        return r;
+    }
+#endif
     if (cmd == L"version" || cmd == L"--version") return wprintf(L"%ls\n", WDT_VERSION), 0;
     if (cmd == L"check") return CmdCheck();
     if (cmd == L"update") return Finish(CmdUpdate(argc > 2 ? Lower(argv[2]) : L"all"));
@@ -1106,6 +1163,7 @@ int wmain(int argc, wchar_t** argv) {
     if (cmd == L"apply") return CmdApply();
     if (cmd == L"attach") return CmdAttach();
     if (cmd == L"launch" || cmd == L"restart") return StartTweaked(false) ? 0 : 1;
+    if (cmd == L"open") return CmdOpen();
     if (cmd == L"list") return ListTweaks(), 0;
     if (cmd == L"status") return CmdStatus();
     if (cmd == L"dump") return CmdDump();
