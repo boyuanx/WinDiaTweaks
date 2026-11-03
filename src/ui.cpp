@@ -158,8 +158,42 @@ static void DescribeElement(std::ostringstream& o, const mux::FrameworkElement& 
     else if (auto g = fe.try_as<muxc::Grid>()) cr(g.CornerRadius());
     else if (auto cp = fe.try_as<muxc::ContentPresenter>()) cr(cp.CornerRadius());
     if (!fe.IsHitTestVisible()) o << " nohit";
+    try {  // brushes in the element's own resources (Dia sets per-site hover colors this way)
+        for (auto const& kv : fe.Resources()) {
+            auto k = kv.Key().try_as<wf::IReference<winrt::hstring>>();
+            o << " res[" << (k ? N(std::wstring(k.Value())) : std::string("?")) << "]";
+            if (auto b = kv.Value().try_as<muxm::SolidColorBrush>()) {
+                auto col = b.Color();
+                o << "=#" << std::hex << (int)col.A << "," << (int)col.R << "," << (int)col.G << "," << (int)col.B << std::dec;
+            }
+        }
+    } catch (...) {
+    }
     if (int z = muxc::Canvas::GetZIndex(fe)) o << " z=" << z;
-    if (auto reb = fe.try_as<muxc::RichEditBox>()) o << (reb.IsReadOnly() ? " readonly" : "") << (reb.AcceptsReturn() ? " acceptsreturn" : "");
+    if (auto reb = fe.try_as<muxc::RichEditBox>()) {
+        o << (reb.IsReadOnly() ? " readonly" : "") << (reb.AcceptsReturn() ? " acceptsreturn" : "");
+        auto hex = [&](winrt::Windows::UI::Color c) {
+            o << "#" << std::hex << (int)c.A << "," << (int)c.R << "," << (int)c.G << "," << (int)c.B << std::dec;
+        };
+        if (auto f = reb.Foreground().try_as<muxm::SolidColorBrush>()) o << " fg=", hex(f.Color());
+        try {  // text colors run by run (Dia colors parts of the address separately)
+            auto doc = reb.Document();
+            winrt::hstring all;
+            doc.GetText(winrt::Microsoft::UI::Text::TextGetOptions::None, all);
+            int len = (int)all.size();
+            o << " runs=";
+            for (int i = 0; i < len && i < 400;) {
+                auto r = doc.GetRange(i, i + 1);
+                r.Expand(winrt::Microsoft::UI::Text::TextRangeUnit::CharacterFormat);
+                int end = r.EndPosition();
+                o << "[" << r.StartPosition() << "-" << end << " ";
+                hex(r.CharacterFormat().ForegroundColor());
+                o << "]";
+                i = end > i ? end : i + 1;
+            }
+        } catch (...) {
+        }
+    }
     if (fe.Clip()) o << " xamlclip";
     o << " row=" << muxc::Grid::GetRow(fe) << " col=" << muxc::Grid::GetColumn(fe);
     if (auto g = fe.try_as<muxc::Grid>()) {
@@ -205,7 +239,13 @@ static void DescribeElement(std::ostringstream& o, const mux::FrameworkElement& 
             o << " childvisual=", dv(child, 0);
     } catch (...) {
     }
-    if (auto tb = fe.try_as<muxc::TextBlock>()) o << " text=\"" << N(std::wstring(tb.Text())) << "\"";
+    if (auto tb = fe.try_as<muxc::TextBlock>()) {
+        o << " text=\"" << N(std::wstring(tb.Text())) << "\"";
+        if (auto f = tb.Foreground().try_as<muxm::SolidColorBrush>()) {
+            auto c = f.Color();
+            o << " fg=#" << std::hex << (int)c.A << "," << (int)c.R << "," << (int)c.G << "," << (int)c.B << std::dec;
+        }
+    }
     if (auto reb = fe.try_as<muxc::RichEditBox>()) {
         winrt::hstring t;
         reb.Document().GetText(winrt::Microsoft::UI::Text::TextGetOptions::None, t);
@@ -319,6 +359,30 @@ struct BoundToggle {
     winrt::weak_ref<muxc::ToggleSwitch> sw;
 };
 static thread_local std::vector<BoundToggle> t_toggles;
+// Drop-downs that are the tweak's switch: their "off" choice turns the tweak off.
+struct BoundChoice {
+    std::wstring key;
+    winrt::weak_ref<muxc::ComboBox> box;
+};
+static thread_local std::vector<BoundChoice> t_choiceSwitches;
+
+// A tweak whose choices include "off" is switched by its drop-down alone (no On/Off switch).
+static bool ChoiceIsSwitch(const TweakInfo& t) {
+    for (auto& [val, label] : t.choices)
+        if (val == L"off") return true;
+    return false;
+}
+
+// The choice a drop-down shows: "off" while the tweak is off.
+static int ChoiceIndex(const std::wstring& key) {
+    for (auto& t : Engine_Tweaks()) {
+        if (t.key != key) continue;
+        std::wstring want = t.enabled ? t.value : L"off";
+        for (size_t i = 0; i < t.choices.size(); i++)
+            if (t.choices[i].first == want) return (int)i;
+    }
+    return 0;
+}
 
 static mux::FrameworkElement Row(const TweakInfo& t) {
     muxc::Grid row;
@@ -365,26 +429,35 @@ static mux::FrameworkElement Row(const TweakInfo& t) {
     controls.VerticalAlignment(mux::VerticalAlignment::Center);
     std::wstring key = t.key;
 
+    bool choiceSwitch = ChoiceIsSwitch(t);
     if (!t.choices.empty()) {
         muxc::ComboBox box;
         box.MinWidth(130);
         int sel = 0, i = 0;
+        std::wstring shown = choiceSwitch && !t.enabled ? std::wstring(L"off") : t.value;
         for (auto& [val, label] : t.choices) {
             muxc::ComboBoxItem ci;
             ci.Content(box_value(label));
             ci.Tag(box_value(val));
             box.Items().Append(ci);
-            if (val == t.value) sel = i;
+            if (val == shown) sel = i;
             i++;
         }
         box.SelectedIndex(sel);
-        box.SelectionChanged([key](wf::IInspectable const& s, auto&&) {
+        box.SelectionChanged([key, choiceSwitch](wf::IInspectable const& s, auto&&) {
             if (t_syncing) return;
             auto ci = s.as<muxc::ComboBox>().SelectedItem().try_as<muxc::ComboBoxItem>();
             if (!ci) return;
             std::wstring v(unbox_value_or<winrt::hstring>(ci.Tag(), L""));
-            Engine_SetTweak(key, Engine_TweakOn(key), &v);
+            if (choiceSwitch && v == L"off") Engine_SetTweak(key, false, nullptr);
+            else Engine_SetTweak(key, choiceSwitch || Engine_TweakOn(key), &v);
         });
+        if (choiceSwitch) {
+            box.IsEnabled(!Engine_SafeMode());
+            winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(box, L"patch_" + key);
+            winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(box, t.title.empty() ? key : t.title);
+            t_choiceSwitches.push_back({key, winrt::make_weak(box)});
+        }
         controls.Children().Append(box);
     } else if (!t.value.empty()) {
         muxc::TextBox box;
@@ -400,6 +473,11 @@ static mux::FrameworkElement Row(const TweakInfo& t) {
         controls.Children().Append(box);
     }
 
+    if (choiceSwitch) {
+        muxc::Grid::SetColumn(controls, 2);
+        row.Children().Append(controls);
+        return row;
+    }
     muxc::ToggleSwitch sw;
     sw.MinWidth(0);
     sw.OnContent(box_value(L"On"));
@@ -615,6 +693,12 @@ static void SyncToggles() {
             bool want = Engine_TweakOn(b.key);
             if (sw.IsOn() != want) sw.IsOn(want);
             sw.IsEnabled(!Engine_SafeMode());
+        }
+    for (auto& c : t_choiceSwitches)
+        if (auto box = c.box.get()) {
+            int want = ChoiceIndex(c.key);
+            if (box.SelectedIndex() != want) box.SelectedIndex(want);
+            box.IsEnabled(!Engine_SafeMode());
         }
     if (auto box = t_presetBox.get())
         if (box.SelectedIndex() != PresetIndex()) box.SelectedIndex(PresetIndex());
@@ -853,6 +937,398 @@ static void UpdateWindowMaterial() {
         t_material.erase(std::remove_if(t_material.begin(), t_material.end(),
                                         [](const MaterialState& m) { return m.applied.empty(); }),
                          t_material.end());
+}
+
+// --- Toolbar color: Dia paints the toolbar strip (and tints its icons and the window buttons)
+// in the site's color. With this on, the strip is see-through, so the sidebar's color or the window
+// material behind it shows, and icons and text take the sidebar's text color.
+struct LookSaved {
+    winrt::weak_ref<mux::DependencyObject> el;
+    mux::DependencyProperty dp{nullptr};
+    wf::IInspectable value{nullptr};          // Dia's local value; null = none
+    mux::Data::BindingBase binding{nullptr};  // or Dia's binding
+    int64_t token = 0;
+};
+static thread_local std::map<std::pair<void*, void*>, LookSaved> t_look;
+static thread_local muxm::Brush t_lookText{nullptr};
+static thread_local bool t_lookPending = false;
+static thread_local winrt::event_token t_lookToken{};
+
+// On with "sidebar"; "off" (Adaptive) also covers `diatweaks set toolbarColor off`.
+static bool ToolbarSidebar() { return Engine_TweakOn(L"toolbarColor") && Engine_TweakValue(L"toolbarColor") != L"off"; }
+
+static muxm::Brush LookClear() {
+    static thread_local muxm::Brush b = muxm::SolidColorBrush(Rgba(0, 0, 0, 0));
+    return b;
+}
+
+// The sidebar's text color, taken from Dia's ⌄ button in the sidebar header (as the Arc URL bar does).
+static muxm::Brush SidebarTextBrush() {
+    for (auto h : FindNodes(L"OverflowButton")) {
+        bool inHeader = false;
+        for (auto p = Engine_Parent(h); p && !inHeader; p = Engine_Parent(p)) inHeader = Engine_Name(p) == L"WindowDragHeader";
+        if (!inHeader) continue;
+        if (auto c = Obj<muxc::Control>(h))
+            if (auto b = c.Foreground()) return b;
+    }
+    return BrushRes(L"TextFillColorPrimaryBrush", Rgba(0xff, 0xff, 0xff));
+}
+
+static mux::DependencyProperty LookForegroundDp(const mux::DependencyObject& d) {
+    if (d.try_as<muxc::Control>()) return muxc::Control::ForegroundProperty();
+    if (d.try_as<muxc::IconElement>()) return muxc::IconElement::ForegroundProperty();
+    if (d.try_as<muxc::TextBlock>()) return muxc::TextBlock::ForegroundProperty();
+    if (d.try_as<muxc::ContentPresenter>()) return muxc::ContentPresenter::ForegroundProperty();
+    return nullptr;
+}
+
+static muxm::Brush LookWant(const mux::DependencyProperty& dp) {
+    if (dp == muxc::Panel::BackgroundProperty()) return LookClear();
+    return t_lookText;  // foregrounds and icon fills
+}
+
+// Remember Dia's value (local or bound) for this property.
+static void LookRemember(LookSaved& s, const mux::DependencyObject& d) {
+    s.value = nullptr, s.binding = nullptr;
+    if (auto fe = d.try_as<mux::FrameworkElement>())
+        if (auto be = fe.GetBindingExpression(s.dp)) {
+            s.binding = be.ParentBinding();
+            return;
+        }
+    auto v = d.ReadLocalValue(s.dp);
+    if (v && v != mux::DependencyProperty::UnsetValue()) s.value = v;
+}
+
+static void LookOverride(const mux::DependencyObject& d, const mux::DependencyProperty& dp) {
+    auto key = std::make_pair(winrt::get_abi(d), winrt::get_abi(dp));
+    auto want = LookWant(dp);
+    if (!want) return;
+    if (!t_look.count(key)) {
+        LookSaved s;
+        s.el = winrt::make_weak(d);
+        s.dp = dp;
+        LookRemember(s, d);
+        // Dia re-tints when the site changes: put the sidebar look straight back, before the frame is drawn,
+        // and keep Dia's new value for when the tweak is turned off.
+        s.token = d.RegisterPropertyChangedCallback(dp, [key](mux::DependencyObject const& o, mux::DependencyProperty const& p) {
+            if (!ToolbarSidebar()) return;
+            auto it = t_look.find(key);
+            auto want = LookWant(p);
+            if (it == t_look.end() || !want || o.ReadLocalValue(p) == want) return;
+            LookRemember(it->second, o);
+            o.SetValue(p, want);
+        });
+        t_look[key] = s;
+    }
+    if (d.ReadLocalValue(dp) != want) d.SetValue(dp, want);
+}
+
+// Dia keeps each toolbar's site palette in the strip's own resources (NavigationBarBackgroundBrush,
+// ButtonBackgroundPointerOver, SubtleFillColorSecondaryBrush for the address field's hover,
+// ControlFillColorDefaultBrush for the Chat button, ...). Those brushes are recolored to the app's own
+// values for the same keys, the ones the sidebar uses, so hover and pressed states look like the sidebar's.
+struct PaletteSaved {
+    winrt::weak_ref<muxm::SolidColorBrush> brush;
+    winrt::Windows::UI::Color dia{}, want{};
+    int64_t token = 0;
+};
+static thread_local std::map<void*, PaletteSaved> t_palette;
+
+static void LookPalette(const mux::FrameworkElement& strip) {
+    for (auto const& kv : strip.Resources()) {
+        auto key = kv.Key().try_as<wf::IReference<winrt::hstring>>();
+        auto b = kv.Value().try_as<muxm::SolidColorBrush>();
+        if (!key || !b) continue;
+        winrt::Windows::UI::Color want{};  // the strip itself: see-through
+        if (key.Value() != L"NavigationBarBackgroundBrush") {
+            auto app = Resource(key.Value().c_str()).try_as<muxm::SolidColorBrush>();
+            if (!app || app == b) continue;
+            want = app.Color();
+        }
+        void* id = winrt::get_abi(b);
+        auto it = t_palette.find(id);
+        if (it == t_palette.end()) {
+            PaletteSaved p;
+            p.brush = winrt::make_weak(b);
+            p.dia = b.Color();
+            // Dia recolors the palette when the site changes: keep its color for later, put ours back.
+            p.token = b.RegisterPropertyChangedCallback(muxm::SolidColorBrush::ColorProperty(),
+                                                        [id](mux::DependencyObject const& o, auto&&) {
+                                                            auto it = t_palette.find(id);
+                                                            if (it == t_palette.end()) return;
+                                                            auto br = o.as<muxm::SolidColorBrush>();
+                                                            if (br.Color() == it->second.want) return;
+                                                            it->second.dia = br.Color();
+                                                            br.Color(it->second.want);
+                                                        });
+            it = t_palette.emplace(id, p).first;
+        }
+        it->second.want = want;
+        if (b.Color() != want) b.Color(want);
+    }
+}
+
+// The address field: on hover Dia fills it with a site-colored brush of its own; use the sidebar's hover fill.
+struct FieldHover {
+    winrt::weak_ref<muxc::Border> bar;
+    muxm::Brush dia{nullptr};
+    int64_t token = 0;
+};
+static thread_local std::map<void*, FieldHover> t_fieldHover;
+
+static muxm::Brush SidebarHoverBrush() {
+    return BrushRes(L"SubtleFillColorSecondaryBrush", Rgba(0xff, 0xff, 0xff, 0x0f));
+}
+
+static bool Opaque(const muxm::Brush& b) {
+    auto s = b.try_as<muxm::SolidColorBrush>();
+    return s && s.Color().A == 255;
+}
+
+static void LookField(const muxc::Border& bar) {
+    void* id = winrt::get_abi(bar);
+    if (!t_fieldHover.count(id)) {
+        FieldHover f;
+        f.bar = winrt::make_weak(bar);
+        f.dia = bar.Background();
+        f.token = bar.RegisterPropertyChangedCallback(muxc::Border::BackgroundProperty(), [id](mux::DependencyObject const& o, auto&&) {
+            auto it = t_fieldHover.find(id);
+            if (it == t_fieldHover.end()) return;
+            auto b = o.as<muxc::Border>();
+            auto cur = b.Background();
+            if (cur == SidebarHoverBrush()) return;
+            it->second.dia = cur;
+            if (Opaque(cur)) b.Background(SidebarHoverBrush());
+        });
+        t_fieldHover[id] = f;
+    }
+    if (Opaque(bar.Background())) bar.Background(SidebarHoverBrush());
+}
+
+// The address text: Dia colors it run by run inside the text (the site part dim, the page title bright,
+// both in site colors). Sidebar: the bright part gets the sidebar's text color, the dim part its secondary
+// text color. Left alone while you type.
+struct AddressRun {
+    int start, end;
+    winrt::Windows::UI::Color color;
+};
+struct AddressSaved {
+    winrt::weak_ref<muxc::RichEditBox> box;
+    winrt::hstring text;
+    std::vector<AddressRun> dia;  // Dia's colors, for Adaptive
+};
+static thread_local std::map<void*, AddressSaved> t_address;
+static thread_local std::set<void*> t_addressHooked;
+static void ScheduleToolbarLook();
+static winrt::Windows::UI::Color SiteColorFor(mux::DependencyObject d);
+
+static winrt::Windows::UI::Color BrushColor(const muxm::Brush& b, winrt::Windows::UI::Color fallback) {
+    if (auto s = b.try_as<muxm::SolidColorBrush>()) return s.Color();
+    return fallback;
+}
+
+static std::vector<AddressRun> AddressRuns(const winrt::Microsoft::UI::Text::RichEditTextDocument& doc, int len) {
+    std::vector<AddressRun> runs;
+    for (int i = 0; i < len && runs.size() < 64;) {
+        auto r = doc.GetRange(i, i + 1);
+        r.Expand(winrt::Microsoft::UI::Text::TextRangeUnit::CharacterFormat);
+        int end = (std::max)(r.EndPosition(), i + 1);
+        AddressRun run{(std::max)(r.StartPosition(), i), end, r.CharacterFormat().ForegroundColor()};
+        runs.push_back(run);
+        i = end;
+    }
+    return runs;
+}
+
+static void LookAddressText(const muxc::RichEditBox& box) {
+    void* id = winrt::get_abi(box);
+    if (!t_address.count(id)) {
+        AddressSaved a;
+        a.box = winrt::make_weak(box);
+        t_address[id] = a;
+    }
+    if (t_addressHooked.insert(id).second) {
+        // Dia rewrites the address (and its colors) on navigation and when you leave the field.
+        box.TextChanged([](auto&&, auto&&) { ScheduleToolbarLook(); });
+        box.LostFocus([](auto&&, auto&&) { ScheduleToolbarLook(); });
+    }
+    if (box.FocusState() != mux::FocusState::Unfocused) return;
+    auto doc = box.Document();
+    winrt::hstring text;
+    doc.GetText(winrt::Microsoft::UI::Text::TextGetOptions::None, text);
+    auto primary = BrushColor(t_lookText, Rgba(0xff, 0xff, 0xff));
+    auto secondary = BrushColor(BrushRes(L"TextFillColorSecondaryBrush", Rgba(0xc5, 0xc5, 0xc5)), Rgba(0xc5, 0xc5, 0xc5));
+    int under = primary.R + primary.G + primary.B > 384 ? 0x2b : 0xf3;  // the bar behind: dark or light theme
+    secondary = {255, (uint8_t)((secondary.R * secondary.A + under * (255 - secondary.A)) / 255),
+                 (uint8_t)((secondary.G * secondary.A + under * (255 - secondary.A)) / 255),
+                 (uint8_t)((secondary.B * secondary.A + under * (255 - secondary.A)) / 255)};
+    primary.A = 255;
+    auto runs = AddressRuns(doc, (int)text.size());
+    bool plain = true;
+    for (auto& r : runs) plain &= r.color == primary || r.color == secondary;
+    if (plain) return;
+    // The part Dia emphasizes stands out most from the site's color (darker on light sites, lighter on dark).
+    auto lum = [](winrt::Windows::UI::Color c) { return 0.2126 * c.R + 0.7152 * c.G + 0.0722 * c.B; };
+    double site = lum(SiteColorFor(box));
+    auto contrast = [&](winrt::Windows::UI::Color c) { return std::abs(lum(c) - site); };
+    double top = 0;
+    for (auto& r : runs)
+        if (r.end - r.start > 1 || runs.size() == 1) top = (std::max)(top, contrast(r.color));  // (not the trailing newline)
+    auto& saved = t_address[id];
+    saved.text = text;
+    saved.dia = runs;
+    doc.BatchDisplayUpdates();
+    for (auto& r : runs) {
+        auto range = doc.GetRange(r.start, r.end);
+        range.CharacterFormat().ForegroundColor(contrast(r.color) >= top - 1 ? primary : secondary);
+    }
+    doc.ApplyDisplayUpdates();
+}
+
+static void AddressRestoreAll() {
+    for (auto& [id, a] : t_address) {
+        auto box = a.box.get();
+        if (!box || a.dia.empty()) continue;
+        auto doc = box.Document();
+        winrt::hstring text;
+        doc.GetText(winrt::Microsoft::UI::Text::TextGetOptions::None, text);
+        if (text != a.text) continue;  // Dia has written it anew: its own colors already
+        doc.BatchDisplayUpdates();
+        for (auto& r : a.dia) doc.GetRange(r.start, r.end).CharacterFormat().ForegroundColor(r.color);
+        doc.ApplyDisplayUpdates();
+    }
+    t_address.clear();
+}
+
+// Dia's color for the site in the toolbar this element is in (kept from before the palette was recolored).
+static winrt::Windows::UI::Color SiteColorFor(mux::DependencyObject d) {
+    auto key = box_value(L"NavigationBarBackgroundBrush");
+    for (int i = 0; d && i < 40; i++, d = muxm::VisualTreeHelper::GetParent(d))
+        if (auto fe = d.try_as<mux::FrameworkElement>(); fe && fe.Resources().HasKey(key))
+            if (auto b = fe.Resources().Lookup(key).try_as<muxm::SolidColorBrush>()) {
+                auto it = t_palette.find(winrt::get_abi(b));
+                return it != t_palette.end() ? it->second.dia : b.Color();
+            }
+    return Rgba(0x2b, 0x2b, 0x2b);
+}
+
+static void PaletteRestoreAll() {
+    AddressRestoreAll();
+    for (auto& [id, f] : t_fieldHover)
+        if (auto bar = f.bar.get()) {
+            bar.UnregisterPropertyChangedCallback(muxc::Border::BackgroundProperty(), f.token);
+            if (bar.Background() == SidebarHoverBrush()) bar.Background(f.dia);
+        }
+    t_fieldHover.clear();
+    for (auto& [id, p] : t_palette)
+        if (auto b = p.brush.get()) {
+            b.UnregisterPropertyChangedCallback(muxm::SolidColorBrush::ColorProperty(), p.token);
+            b.Color(p.dia);
+        }
+    t_palette.clear();
+}
+
+// Still in the toolbar or the window buttons (the Arc URL bar moves toolbar buttons into the sidebar,
+// where they keep the sidebar color it gave them).
+static bool LookInChrome(mux::DependencyObject d) {
+    for (int i = 0; d && i < 40; i++, d = muxm::VisualTreeHelper::GetParent(d))
+        if (auto fe = d.try_as<mux::FrameworkElement>(); fe && (fe.Name() == L"NavigationBarHost" || fe.Name() == L"RootGrid"))
+            return true;
+    return false;
+}
+
+static void LookRestoreAll() {
+    for (auto& [k, s] : t_look) {
+        auto d = s.el.get();
+        if (!d) continue;
+        try {
+            d.UnregisterPropertyChangedCallback(s.dp, s.token);
+            if (!LookInChrome(d)) continue;
+            if (s.binding) d.as<mux::FrameworkElement>().SetBinding(s.dp, s.binding);
+            else if (s.value) d.SetValue(s.dp, s.value);
+            else d.ClearValue(s.dp);
+        } catch (...) {
+        }
+    }
+    t_look.clear();
+}
+
+// Icons and text under the toolbar or the window buttons: buttons always (Dia colors them through their
+// style), anything inside only where Dia set a color of its own.
+static void LookWalk(const mux::DependencyObject& d, int depth) {
+    if (!d || depth > 16) return;
+    // Not the address box: setting its foreground recolors all of its text, wiping Dia's (or our) colors
+    // for the site and the title. Its text is colored run by run instead (LookAddressText).
+    if (auto dp = d.try_as<muxc::RichEditBox>() ? nullptr : LookForegroundDp(d)) {
+        bool own = d.try_as<muxc::Primitives::ButtonBase>() != nullptr;
+        if (!own) {
+            auto v = d.ReadLocalValue(dp);
+            own = v && v != mux::DependencyProperty::UnsetValue();
+        }
+        if (!own)
+            if (auto fe = d.try_as<mux::FrameworkElement>()) own = fe.GetBindingExpression(dp) != nullptr;
+        if (own) LookOverride(d, dp);
+    }
+    if (auto path = d.try_as<muxsh::Path>(); path && path.Name() == L"ChatButtonIcon")  // a filled shape
+        LookOverride(d, muxsh::Shape::FillProperty());
+    int n = muxm::VisualTreeHelper::GetChildrenCount(d);
+    for (int i = 0; i < n; i++) LookWalk(muxm::VisualTreeHelper::GetChild(d, i), depth + 1);
+}
+
+static void UpdateToolbarLook() {
+    if (!ToolbarSidebar()) {
+        if (!t_look.empty() || !t_palette.empty() || !t_fieldHover.empty() || !t_address.empty())
+            LookRestoreAll(), PaletteRestoreAll(), t_lookText = nullptr, Log("toolbar color: adaptive");
+        return;
+    }
+    auto text = SidebarTextBrush();
+    if (text != t_lookText) {
+        bool first = !t_lookText;
+        t_lookText = text;
+        // The sidebar's color changed (theme): re-apply everywhere.
+        for (auto& [k, s] : t_look)
+            if (auto d = s.el.get(); d && LookWant(s.dp) == text) d.SetValue(s.dp, text);
+        if (first) Log("toolbar color: sidebar");
+    }
+    for (auto h : FindNodes(L"NavigationBarHost")) {
+        auto host = Obj<mux::DependencyObject>(h);
+        if (!host || !muxm::VisualTreeHelper::GetChildrenCount(host)) continue;
+        // NavigationBarHost > ContentPresenter > Grid: the Grid paints the strip.
+        auto cp = muxm::VisualTreeHelper::GetChild(host, 0);
+        if (muxm::VisualTreeHelper::GetChildrenCount(cp))
+            if (auto strip = muxm::VisualTreeHelper::GetChild(cp, 0).try_as<muxc::Panel>()) {
+                LookOverride(strip, muxc::Panel::BackgroundProperty());
+                LookPalette(strip);
+            }
+        LookWalk(host, 0);
+    }
+    for (auto h : FindNodes(L"AssistantBar"))
+        if (auto bar = Obj<muxc::Border>(h); bar && LookInChrome(bar)) LookField(bar);
+    for (auto h : FindNodes(L"AddressRichEditBox"))
+        if (auto box = Obj<muxc::RichEditBox>(h); box && LookInChrome(box)) LookAddressText(box);
+    for (auto h : FindNodes(L"MinimizeButton")) {  // the window buttons' grid
+        auto grid = Engine_Parent(h);
+        if (Engine_Name(grid) == L"RootGrid")
+            if (auto g = Obj<mux::DependencyObject>(grid)) LookWalk(g, 0);
+    }
+    for (auto it = t_look.begin(); it != t_look.end();) it = it->second.el.get() ? std::next(it) : t_look.erase(it);
+    for (auto it = t_palette.begin(); it != t_palette.end();) it = it->second.brush.get() ? std::next(it) : t_palette.erase(it);
+    for (auto it = t_fieldHover.begin(); it != t_fieldHover.end();) it = it->second.bar.get() ? std::next(it) : t_fieldHover.erase(it);
+    for (auto it = t_address.begin(); it != t_address.end();) it = it->second.box.get() ? std::next(it) : t_address.erase(it);
+}
+
+// Dia builds a toolbar for each tab it shows; give it the sidebar look before its first frame is drawn.
+static void ScheduleToolbarLook() {
+    if (t_lookPending || !ToolbarSidebar()) return;
+    t_lookPending = true;
+    t_lookToken = muxm::CompositionTarget::Rendering([](auto&&, auto&&) {
+        muxm::CompositionTarget::Rendering(t_lookToken);
+        t_lookPending = false;
+        try {
+            UpdateToolbarLook();
+        } catch (...) {
+        }
+    });
 }
 
 // --- Square corners by the sidebar: Dia rounds the page with several unnamed borders and grids
@@ -1892,6 +2368,7 @@ void Ui_ElementAdded(const std::wstring& name) {
         if (n++ < 40) Log("arc: %s added (%.0f)", N(name).c_str(), NowMs());
         ScheduleArcAdopt();
     }
+    if (name == L"NavigationBarContent" || name == L"NavigationBarHost" || name == L"MinimizeButton") ScheduleToolbarLook();
 }
 
 static void UpdateArcBar() {
@@ -2807,6 +3284,7 @@ bool Ui_Tick() {
         UpdateNewTabMode();
         if (tick % 3 == 0) {
             UpdateWindowMaterial();
+            UpdateToolbarLook();
             UpdateAddressField();
             UpdateProfileEmoji();
             UpdateSquareCorners();
