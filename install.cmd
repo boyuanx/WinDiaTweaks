@@ -9,6 +9,10 @@ set "PS=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
 cd /d "%~dp0"
 %PS% -NoProfile -Command "if (-not (Get-AppxPackage TheBrowserCompany.Dia)) { exit 1 }" || (echo Dia isn't installed. Get it from https://www.diabrowser.com first. & exit /b 1)
 
+rem Updating: Dia can't have the add-on loaded while it's rebuilt, so close Dia first (it reopens with
+rem the tweaks at the end). Asked politely first, so it can save its tabs.
+if exist bin\DiaTweaksTap.dll %PS% -NoProfile -Command "$d = Get-Process Dia -ErrorAction SilentlyContinue; if ($d) { Write-Host 'Closing Dia to update WinDiaTweaks...'; $d | ForEach-Object { [void]$_.CloseMainWindow() }; Start-Sleep -Seconds 3; Get-Process Dia -ErrorAction SilentlyContinue | Stop-Process -Force; Start-Sleep -Seconds 1 }"
+
 call "%~dp0build.cmd" || (echo. & echo Build failed. See "Install" in README.md for what it needs. & (if defined UPDATE pause) & exit /b 1)
 
 set "LNK=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Dia (Tweaks).lnk"

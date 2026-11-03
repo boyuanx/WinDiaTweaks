@@ -106,6 +106,16 @@ You can name a tweak by its key (`hideToolbar`) or by the title shown in Setting
 
 Or from PowerShell: `diatweaks check` to see what's new, `diatweaks update` to install it (`diatweaks update dia` or `diatweaks update tweaks` for one of them).
 
+### Installed before v1.0.0?
+
+Versions before v1.0.0 don't have **Updates** yet, so update once by hand. In PowerShell:
+
+```powershell
+cd "$HOME\WinDiaTweaks"; git pull; .\install.cmd
+```
+
+It closes Dia, rebuilds WinDiaTweaks and reopens Dia. Your patches stay as they were, and tweaks added since show up switched off. From then on, use **Settings → Patches → Updates**.
+
 Building it yourself, if the build complains after Dia updates, delete the `gen` and `winmd` folders and run `install.cmd` again: they're made from the Dia you have installed.
 
 ## FAQ
