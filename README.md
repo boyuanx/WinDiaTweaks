@@ -151,3 +151,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 ## License
 
 [MIT](LICENSE)
+| Toolbar color | Adaptive (follows the site, Dia's default) or Sidebar (same color or window material as the sidebar) |
