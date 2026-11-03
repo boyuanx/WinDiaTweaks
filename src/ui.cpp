@@ -2380,6 +2380,69 @@ static void SetCaptionHidden(CaptionState& c, bool hide, bool animate) {
     else RestoreButtonRegions(c);
 }
 
+// Dia draws each button's hover background inset (4px from the top, and from the right on Close), so the
+// buttons don't reach the window's corner. Stretch that background to fill the whole button. The buttons
+// are also 4px taller than the toolbar strip behind them, so they're cut to its height.
+// Close has a rounded top-right corner to follow the window's corner; when the window is maximized or full
+// screen the window has square corners, so Close does too.
+static bool WindowFillsScreen(const mux::FrameworkElement& el) {
+    try {
+        auto id = el.XamlRoot().ContentIslandEnvironment().AppWindowId();
+        HWND top = GetAncestor((HWND)(uintptr_t)id.Value, GA_ROOT);
+        if (!top) return false;
+        if (IsZoomed(top)) return true;
+        MONITORINFO mi{sizeof(mi)};
+        RECT r;
+        if (!GetWindowRect(top, &r) || !GetMonitorInfoW(MonitorFromWindow(top, MONITOR_DEFAULTTONEAREST), &mi)) return false;
+        return r.left <= mi.rcMonitor.left && r.top <= mi.rcMonitor.top && r.right >= mi.rcMonitor.right &&
+               r.bottom >= mi.rcMonitor.bottom;
+    } catch (...) {
+        return false;
+    }
+}
+
+static void SetCloseCorner(const mux::DependencyObject& el, bool square) {
+    static thread_local mux::CornerRadius diaRadius{0, 3, 0, 0};  // Dia's own, learned when first seen
+    auto set = [&](mux::CornerRadius cur, auto apply) {
+        bool isSquare = !cur.TopLeft && !cur.TopRight && !cur.BottomRight && !cur.BottomLeft;
+        if (!isSquare && !square) diaRadius = cur;
+        mux::CornerRadius want = square ? mux::CornerRadius{0, 0, 0, 0} : diaRadius;
+        if (cur.TopLeft != want.TopLeft || cur.TopRight != want.TopRight || cur.BottomRight != want.BottomRight ||
+            cur.BottomLeft != want.BottomLeft)
+            apply(want);
+    };
+    if (auto c = el.try_as<muxc::Control>()) set(c.CornerRadius(), [&](mux::CornerRadius r) { c.CornerRadius(r); });
+    else if (auto b = el.try_as<muxc::Border>()) set(b.CornerRadius(), [&](mux::CornerRadius r) { b.CornerRadius(r); });
+}
+
+static void GlueCaptionButtons(const mux::FrameworkElement& grid, double height) {
+    bool square = WindowFillsScreen(grid);
+    int n = muxm::VisualTreeHelper::GetChildrenCount(grid);
+    for (int i = 0; i < n; i++) {
+        auto child = muxm::VisualTreeHelper::GetChild(grid, i);
+        auto btn = child.try_as<muxc::Button>();
+        if (btn && height > 1) {
+            if (std::isnan(btn.Height()) || std::abs(btn.Height() - height) > 0.1) btn.Height(height);
+            if (btn.VerticalAlignment() != mux::VerticalAlignment::Top) btn.VerticalAlignment(mux::VerticalAlignment::Top);
+        }
+        auto bg = FindVisual(child, [](const mux::DependencyObject& d) {
+            auto fe = d.try_as<mux::FrameworkElement>();
+            return fe && fe.Name() == L"BackgroundBorder";
+        }).try_as<mux::FrameworkElement>();
+        if (btn && btn.Name() == L"CloseButton") {
+            SetCloseCorner(btn, square);
+            if (bg) SetCloseCorner(bg, square);
+        }
+        if (!bg) continue;
+        auto m = bg.Margin();
+        if (m.Left || m.Top || m.Right || m.Bottom) bg.Margin({0, 0, 0, 0});
+        if (!std::isnan(bg.Width())) bg.Width(std::numeric_limits<double>::quiet_NaN());
+        if (!std::isnan(bg.Height())) bg.Height(std::numeric_limits<double>::quiet_NaN());
+        if (bg.HorizontalAlignment() != mux::HorizontalAlignment::Stretch) bg.HorizontalAlignment(mux::HorizontalAlignment::Stretch);
+        if (bg.VerticalAlignment() != mux::VerticalAlignment::Stretch) bg.VerticalAlignment(mux::VerticalAlignment::Stretch);
+    }
+}
+
 // For the "Hide window buttons" tweak (no animation) and for windows with no hidden toolbar.
 static void UpdateCaptionButtons(const std::function<bool(const mux::FrameworkElement&)>& toolbarHidden) {
     FindCaptions();
@@ -2387,6 +2450,13 @@ static void UpdateCaptionButtons(const std::function<bool(const mux::FrameworkEl
     for (auto& [h, c] : t_caption) {
         auto fe = c.grid.get();
         if (!fe) continue;
+        double barH = 0;  // this window's toolbar strip
+        for (auto bh : FindNodes(L"NavigationBarHost"))
+            if (auto bar = Obj<mux::FrameworkElement>(bh); bar && bar.XamlRoot() == fe.XamlRoot() && bar.ActualHeight() > 1) {
+                barH = bar.ActualHeight();
+                break;
+            }
+        GlueCaptionButtons(fe, barH);
         bool hide = always || toolbarHidden(fe);
         if (hide != c.hidden) SetCaptionHidden(c, hide, !always);
     }
