@@ -481,10 +481,10 @@ static void ApplyPreset(const std::wstring& preset) {
     std::vector<std::pair<std::wstring, std::wstring>> values{{L"preset", preset}};
     if (preset == L"custom") return Engine_SetMany({}, values);  // keep the patches as they are
     // Arc: the page fills the window with straight edges, the toolbar lives in the sidebar, Ctrl+T
-    // floats, an acrylic window.
+    // floats, no tab hover cards, an acrylic window.
     static const std::set<std::wstring> arc = {L"edgeToEdge",     L"squareCorners",       L"hideToolbar",
                                                L"arcUrlBar",      L"floatingNewTab",      L"hideTabSearchButton",
-                                               L"hideChatButton", L"windowMaterial"};
+                                               L"hideChatButton", L"hideTabHoverCard",    L"windowMaterial"};
     std::vector<std::pair<std::wstring, bool>> states;
     for (auto& t : Engine_Tweaks())
         if (t.key != L"preset") states.push_back({t.key, preset == L"arc" && arc.count(t.key) > 0});
@@ -503,8 +503,8 @@ static mux::FrameworkElement PresetRow() {
     TweakInfo info;
     info.title = L"Preset";
     info.desc = L"None: Dia as it comes. Arc: address bar and buttons in the sidebar, no toolbar (it slides in "
-                L"at the top edge), edge-to-edge pages with square corners, floating Ctrl+T bar, acrylic "
-                L"window. Custom: your own mix; changing any patch below switches to it.";
+                L"at the top edge), edge-to-edge pages with square corners, floating Ctrl+T bar, no tab hover "
+                L"cards, acrylic window. Custom: your own mix; changing any patch below switches to it.";
     info.icon = L"E771";
     auto row = Row(info).as<muxc::Grid>();
     t_toggles.pop_back();  // Row() made a switch; a drop-down instead
@@ -1115,6 +1115,62 @@ static void UpdateDownloadsPopup() {
         if (dl && !userJustActed) {
             popup.IsOpen(false);
             Log("closed downloads pop-up");
+        }
+    });
+}
+
+// --- Hide tab hover card: the card (title, site, pin/bookmark/... buttons) Dia shows when the pointer
+// rests on a tab or pinned tab. It's a flyout whose content holds TitleText, SubtitleText and
+// ActionsRow; its FlyoutPresenter is collapsed, so nothing is drawn and nothing can be clicked.
+static thread_local std::vector<winrt::weak_ref<muxc::FlyoutPresenter>> t_hiddenCards;
+static thread_local bool t_cardPending = false;
+static thread_local winrt::event_token t_cardToken{};
+
+static void HideHoverCard(const mux::FrameworkElement& row) {
+    auto panel = muxm::VisualTreeHelper::GetParent(row);
+    if (!panel) return;
+    auto has = [&](const wchar_t* name) {
+        return FindVisual(panel, [name](const mux::DependencyObject& d) {
+                   auto fe = d.try_as<mux::FrameworkElement>();
+                   return fe && fe.Name() == name;
+               }) != nullptr;
+    };
+    if (!has(L"TitleText") || !has(L"SubtitleText")) return;
+    mux::DependencyObject p = panel;
+    for (int i = 0; p && i < 20; i++, p = muxm::VisualTreeHelper::GetParent(p)) {
+        auto fp = p.try_as<muxc::FlyoutPresenter>();
+        if (!fp) continue;
+        if (fp.Visibility() != mux::Visibility::Collapsed) {
+            fp.Visibility(mux::Visibility::Collapsed);
+            t_hiddenCards.push_back(winrt::make_weak(fp));
+            static int n = 0;
+            if (n++ < 5) Log("hid tab hover card");
+        }
+        return;
+    }
+}
+
+static void UpdateHoverCards() {
+    if (!Engine_TweakOn(L"hideTabHoverCard")) {
+        for (auto& w : t_hiddenCards)
+            if (auto fp = w.get()) fp.Visibility(mux::Visibility::Visible);
+        t_hiddenCards.clear();
+        return;
+    }
+    for (auto h : FindNodes(L"ActionsRow"))
+        if (auto row = Obj<mux::FrameworkElement>(h)) HideHoverCard(row);
+}
+
+// Runs before the next frame, so the card never shows up even for one frame.
+static void ScheduleHoverCards() {
+    if (t_cardPending || !Engine_TweakOn(L"hideTabHoverCard")) return;
+    t_cardPending = true;
+    t_cardToken = muxm::CompositionTarget::Rendering([](auto&&, auto&&) {
+        muxm::CompositionTarget::Rendering(t_cardToken);
+        t_cardPending = false;
+        try {
+            UpdateHoverCards();
+        } catch (...) {
         }
     });
 }
@@ -1892,6 +1948,7 @@ void Ui_ElementAdded(const std::wstring& name) {
         if (n++ < 40) Log("arc: %s added (%.0f)", N(name).c_str(), NowMs());
         ScheduleArcAdopt();
     }
+    if (name == L"ActionsRow") ScheduleHoverCards();
 }
 
 static void UpdateArcBar() {
@@ -2875,6 +2932,7 @@ bool Ui_Tick() {
             if (!Engine_TweakOn(L"arcUrlBar")) HookCommandBarPopovers();  // (Arc mode hooks them already)
         }
         UpdateNewTabMode();
+        UpdateHoverCards();
         if (tick % 3 == 0) {
             UpdateWindowMaterial();
             UpdateAddressField();

@@ -17,7 +17,7 @@ Every tweak targets a single detail of Dia's interface: the margin around web pa
 At the top of **Patches**, **Preset** sets everything at once:
 
 - **None**: Dia as it comes (the default).
-- **Arc**: the address bar and buttons move into the sidebar, the toolbar hides, pages go edge to edge with square corners, Ctrl+T opens a floating bar, the window turns acrylic.
+- **Arc**: the address bar and buttons move into the sidebar, the toolbar hides, pages go edge to edge with square corners, Ctrl+T opens a floating bar, tab hover cards stop popping up, the window turns acrylic.
 - **Custom**: your own mix. Changing any tweak switches to it.
 
 | Tweak | Does |
@@ -39,6 +39,7 @@ At the top of **Patches**, **Preset** sets everything at once:
 | Hide page loading animation ✨ | Hides the orange bar that sweeps across the address field while a page loads |
 | **Sidebar & tab bar** | |
 | Hide pinned tab border | Removes the colored border around the selected pinned tab |
+| Hide tab hover card ✨ | Stops the card with the page title, site and buttons from popping up when you hover a tab or pinned tab |
 | Profile emoji | Shows an emoji for this profile at the top of the sidebar |
 | Don't pop up downloads | Stops the downloads list from opening by itself for each download |
 | Translucent sidebar | Lets the page show through the sidebar when it floats over the page |
