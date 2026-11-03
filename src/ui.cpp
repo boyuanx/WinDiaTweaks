@@ -881,6 +881,9 @@ static void FillUpdates(muxc::Border host) {
     std::function<void()> twClick = [url] { OpenUrl(url.empty() ? L"https://github.com/zioder/WinDiaTweaks/releases" : url); };
     if (!u.checked) twDesc = u.checking ? L"Checking for updates..." : L"Not checked yet.";
     else if (noAnswer) twDesc = L"Couldn't check.";
+    else if (!get("tweaks.dev").empty())
+        twDesc = L"Development build " + have + L" (" + get("tweaks.dev") + L"), so it isn't updated from here." +
+                 (latest.empty() ? L"" : L" The newest release is " + latest + L".");
     else if (tweaksNew) {
         twDesc = L"WinDiaTweaks " + latest + L" is available. You have " + have + L"." +
                  (git ? L" It updates this clone with git pull and rebuilds it." : L"") +

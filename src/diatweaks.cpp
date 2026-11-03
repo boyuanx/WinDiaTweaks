@@ -519,6 +519,49 @@ static std::wstring RepoRoot() {
     return GetFileAttributesW((root + L"\\.git").c_str()) != INVALID_FILE_ATTRIBUTES ? root : L"";
 }
 
+// Runs a command hidden and returns what it printed, if it succeeded.
+static bool Capture(std::wstring cmdline, std::string& out) {
+    SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
+    HANDLE rd = nullptr, wr = nullptr;
+    if (!CreatePipe(&rd, &wr, &sa, 0)) return false;
+    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+    STARTUPINFOW si{sizeof(si)};
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = wr;
+    PROCESS_INFORMATION pi{};
+    BOOL ok = CreateProcessW(nullptr, cmdline.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    CloseHandle(wr);
+    if (!ok) {
+        CloseHandle(rd);
+        return false;
+    }
+    char buf[4096];
+    DWORD n = 0, code = 1;
+    while (ReadFile(rd, buf, sizeof(buf), &n, nullptr) && n) out.append(buf, n);
+    CloseHandle(rd);
+    WaitForSingleObject(pi.hProcess, 30000);
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) out.pop_back();
+    return code == 0;
+}
+
+// A clone someone works in (another branch than main, or changes not committed) is a development
+// build: its version is whatever was built, so it isn't offered releases and is never pulled.
+// Returns why it is one, or nothing for a release or a clean main.
+static std::wstring DevBuildReason() {
+    std::wstring root = RepoRoot();
+    if (root.empty()) return {};
+    std::wstring git = L"git -C \"" + root + L"\" ";
+    std::string branch, changes;
+    if (!Capture(git + L"rev-parse --abbrev-ref HEAD", branch)) return L"git isn't available to update it";
+    if (branch != "main") return L"on branch " + W(branch);
+    if (!Capture(git + L"status --porcelain --untracked-files=no", changes)) return L"git isn't available to update it";
+    if (!changes.empty()) return L"with changes that aren't committed";
+    return {};
+}
+
 static std::wstring Message(const winrt::hresult_error& e) {
     std::wstring m(e.message());
     while (!m.empty() && (m.back() == L'\n' || m.back() == L'\r' || m.back() == L' ')) m.pop_back();
@@ -683,11 +726,13 @@ static int CmdCheck() {
     };
     put("tweaks.installed", WDT_VERSION);
     put("tweaks.source", RepoRoot().empty() ? L"release" : L"git");
+    std::wstring dev = DevBuildReason();
+    put("tweaks.dev", dev);
     Release r = LatestRelease();
     put("tweaks.latest", r.tag);
     put("tweaks.url", r.url.empty() ? L"https://github.com/" + Repo() + L"/releases" : r.url);
     put("tweaks.notes", r.notes);
-    put("tweaks.available", Newer(r.tag, WDT_VERSION) ? L"1" : L"0");
+    put("tweaks.available", dev.empty() && Newer(r.tag, WDT_VERSION) ? L"1" : L"0");
     put("tweaks.error", r.error);
     DiaVersion d = CheckDia();
     put("dia.installed", d.installed);
@@ -782,6 +827,12 @@ static int UpdateDia(bool relaunch) {
 // the downloaded release, or cmd for a clone. Returns once that process is started (handedOff), which
 // reopens Dia when it's done.
 static int UpdateTweaks(bool force, bool* handedOff = nullptr) {
+    std::wstring dev = DevBuildReason();
+    if (!dev.empty()) {
+        fwprintf(stderr, L"This WinDiaTweaks is a development build (%ls), so it isn't updated from here. Use git.\n",
+                 dev.c_str());
+        return 1;
+    }
     wprintf(L"Checking for a new WinDiaTweaks...\n");
     Release r = LatestRelease();
     if (r.tag.empty()) {
