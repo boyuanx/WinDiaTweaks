@@ -29,6 +29,7 @@ At the top of **Patches**, **Preset** sets everything at once:
 | Hide toolbar (reveal on hover) | Hides the toolbar; it slides back in while the pointer is at the top of the window |
 | Show toolbar with the sidebar | With the toolbar hidden, shows it while the sidebar is open |
 | Show toolbar on new tab pages | With the toolbar hidden, keeps it on new tab pages |
+| Toolbar color ✨ | Adaptive (follows the site, Dia's default) or Sidebar (same color or window material as the sidebar) |
 | Arc URL bar ✨ | Moves the sidebar button, back, forward, reload and the address into the top of the sidebar, like Arc. The address shows just the site; its buttons appear on hover |
 | Floating new tab bar ✨ | Ctrl+T shows the address bar floating over the page instead of a New Tab page; Enter opens the result in a new tab |
 | **Toolbar items** | |
@@ -168,4 +169,3 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 ## License
 
 [MIT](LICENSE)
-| Toolbar color | Adaptive (follows the site, Dia's default) or Sidebar (same color or window material as the sidebar) |
