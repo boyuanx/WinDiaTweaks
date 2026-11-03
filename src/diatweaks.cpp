@@ -60,6 +60,28 @@ static BOOL CALLBACK FindWinUIWindow(HWND hwnd, LPARAM lp) {
     return TRUE;
 }
 
+// Dia's visible main window, once it has one.
+static HWND DiaWindow(DWORD pid) {
+    struct Search {
+        DWORD pid;
+        HWND hwnd;
+    } s{pid, nullptr};
+    EnumWindows(
+        [](HWND h, LPARAM lp) -> BOOL {
+            auto s = reinterpret_cast<Search*>(lp);
+            DWORD p = 0;
+            wchar_t cls[128];
+            GetWindowThreadProcessId(h, &p);
+            if (p != s->pid || !IsWindowVisible(h) || !GetClassNameW(h, cls, 128) ||
+                wcscmp(cls, L"WinUIDesktopWin32WindowClass") != 0)
+                return TRUE;
+            s->hwnd = h;
+            return FALSE;
+        },
+        (LPARAM)&s);
+    return s.hwnd;
+}
+
 static std::vector<DWORD> DiaPids() {
     std::vector<DWORD> out;
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -219,14 +241,27 @@ static const wchar_t kDiaAppId[] = L"TheBrowserCompany.Dia_ttt1ap7aakyb4!Dia";
 
 // Activate Dia the way the Start menu does; *pid gets the process it started or brought forward. With
 // Dia already open, Dia handles it like a click on its own icon.
+// Windows only lets the app that got the last input bring a window to the front. The launcher, started
+// from Start or a taskbar pin, doesn't qualify (the app you were in is active again by then), so Dia
+// would open behind it. A no-op input of our own (no movement, no buttons; the way PowerToys does it)
+// makes us qualify.
+static void TakeForegroundRight() {
+    INPUT in{};
+    in.type = INPUT_MOUSE;
+    SendInput(1, &in, sizeof(in));
+}
+
 static bool ActivateDia(DWORD* pid = nullptr) {
     IApplicationActivationManager* am = nullptr;
     if (FAILED(CoCreateInstance(CLSID_ApplicationActivationManager, nullptr, CLSCTX_LOCAL_SERVER, IID_PPV_ARGS(&am))))
         return false;
-    AllowSetForegroundWindow(ASFW_ANY);  // pass on the click that started us, so Dia comes to the front
+    TakeForegroundRight();
+    AllowSetForegroundWindow(ASFW_ANY);  // so Dia can come to the front, as from its own icon
     DWORD started = 0;
     bool ok = SUCCEEDED(am->ActivateApplication(kDiaAppId, nullptr, AO_NONE, &started));
     am->Release();
+    // The grant above ends with your next input; this one stays with Dia until its window shows.
+    if (ok && started) AllowSetForegroundWindow(started);
     if (pid) *pid = ok ? started : 0;
     return ok;
 }
@@ -386,10 +421,11 @@ static int SetTweak(const std::wstring& which, bool on) {
 // ---------------------------------------------------------------- launching
 
 static DWORD WaitForTap(int seconds) {
-    for (int i = 0; i < seconds * 4; i++) {
+    // Polled often: the launcher raises Dia's window as soon as this returns.
+    for (ULONGLONG end = GetTickCount64() + seconds * 1000ull; GetTickCount64() < end;) {
         DWORD p = FindDiaUiPid();
         if (p && TapAttached(p)) return p;
-        Sleep(250);
+        Sleep(20);
     }
     return 0;
 }
@@ -1066,7 +1102,22 @@ static bool CreateShortcut(const std::wstring& target) {
 // Dia can't be brought forward.
 static int CmdOpen() {
     DWORD pid = FindDiaMainPid();
-    if (!pid) return StartTweaked(true) ? 0 : 1;
+    if (!pid) {
+        // The app in front a second after the click (Start or the taskbar has let go by then). If that's
+        // still the one in front when Dia's window shows, you were waiting for Dia: bring it forward.
+        // If you switched to something else meanwhile, leave it, as Windows would.
+        static HWND volatile activeAfterClick = nullptr;
+        CloseHandle(CreateThread(
+            nullptr, 0, [](LPVOID) -> DWORD { return Sleep(1000), activeAfterClick = GetForegroundWindow(), 0; },
+            nullptr, 0, nullptr));
+        if (!(pid = StartTweaked(true))) return 1;
+        HWND w = DiaWindow(pid), front = GetForegroundWindow();
+        if (w && front != w && (!activeAfterClick || front == activeAfterClick)) {
+            TakeForegroundRight();
+            SetForegroundWindow(w);
+        }
+        return 0;
+    }
     bool tweaked = EnsureTweaked(pid, 15);
     if (!ActivateDia() && !OpenDiaViaShell()) {  // still show Dia, even when the tweaks failed
         fwprintf(stderr, L"Couldn't bring Dia to the front.\n");
