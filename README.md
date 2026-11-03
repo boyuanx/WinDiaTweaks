@@ -17,7 +17,7 @@ Every tweak targets a single detail of Dia's interface: the margin around web pa
 At the top of **Patches**, **Preset** sets everything at once:
 
 - **None**: Dia as it comes (the default).
-- **Arc**: the address bar and buttons move into the sidebar, the toolbar hides, pages go edge to edge with square corners, Ctrl+T opens a floating bar, the window turns acrylic.
+- **Arc**: the address bar and buttons move into the sidebar, the toolbar hides, pages go edge to edge with square corners, Ctrl+T opens a floating bar, tab hover cards stop popping up, the window turns acrylic.
 - **Custom**: your own mix. Changing any tweak switches to it.
 
 | Tweak | Does |

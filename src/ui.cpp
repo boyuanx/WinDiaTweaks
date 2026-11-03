@@ -481,10 +481,10 @@ static void ApplyPreset(const std::wstring& preset) {
     std::vector<std::pair<std::wstring, std::wstring>> values{{L"preset", preset}};
     if (preset == L"custom") return Engine_SetMany({}, values);  // keep the patches as they are
     // Arc: the page fills the window with straight edges, the toolbar lives in the sidebar, Ctrl+T
-    // floats, an acrylic window.
+    // floats, no tab hover cards, an acrylic window.
     static const std::set<std::wstring> arc = {L"edgeToEdge",     L"squareCorners",       L"hideToolbar",
                                                L"arcUrlBar",      L"floatingNewTab",      L"hideTabSearchButton",
-                                               L"hideChatButton", L"windowMaterial"};
+                                               L"hideChatButton", L"hideTabHoverCard",    L"windowMaterial"};
     std::vector<std::pair<std::wstring, bool>> states;
     for (auto& t : Engine_Tweaks())
         if (t.key != L"preset") states.push_back({t.key, preset == L"arc" && arc.count(t.key) > 0});
@@ -503,8 +503,8 @@ static mux::FrameworkElement PresetRow() {
     TweakInfo info;
     info.title = L"Preset";
     info.desc = L"None: Dia as it comes. Arc: address bar and buttons in the sidebar, no toolbar (it slides in "
-                L"at the top edge), edge-to-edge pages with square corners, floating Ctrl+T bar, acrylic "
-                L"window. Custom: your own mix; changing any patch below switches to it.";
+                L"at the top edge), edge-to-edge pages with square corners, floating Ctrl+T bar, no tab hover "
+                L"cards, acrylic window. Custom: your own mix; changing any patch below switches to it.";
     info.icon = L"E771";
     auto row = Row(info).as<muxc::Grid>();
     t_toggles.pop_back();  // Row() made a switch; a drop-down instead
