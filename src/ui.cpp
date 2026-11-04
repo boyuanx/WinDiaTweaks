@@ -2182,18 +2182,22 @@ static void ArcOff(ArcState& st) {
 // Is the mouse pointer over this element right now (and over its window, not something on top)?
 static bool PointerInside(const mux::FrameworkElement& el) {
     POINT pt;
-    if (!el || !el.XamlRoot() || !GetCursorPos(&pt)) return false;
+    if (!el) return false;
+    auto xamlRoot = el.XamlRoot();
+    if (!xamlRoot || !GetCursorPos(&pt)) return false;
     HWND under = WindowFromPoint(pt);
     HWND root = under ? GetAncestor(under, GA_ROOT) : nullptr;
     DWORD pid = 0;
     if (!root || (GetWindowThreadProcessId(root, &pid), pid) != GetCurrentProcessId()) return false;
     try {
-        auto id = el.XamlRoot().ContentIslandEnvironment().AppWindowId();
+        auto environment = xamlRoot.ContentIslandEnvironment();
+        if (!environment) return false;
+        auto id = environment.AppWindowId();
         if ((HWND)(uintptr_t)id.Value != root) return false;
     } catch (...) {
     }
     ScreenToClient(root, &pt);
-    double scale = el.XamlRoot().RasterizationScale();
+    double scale = xamlRoot.RasterizationScale();
     double x = pt.x / scale, y = pt.y / scale;
     auto o = el.TransformToVisual(nullptr).TransformPoint({0, 0});
     return x >= o.X && y >= o.Y && x < o.X + el.ActualWidth() && y < o.Y + el.ActualHeight();
@@ -3227,16 +3231,32 @@ static void RestoreButtonRegions(CaptionState& c) {
 
 // Find the window-button grid for every browser window and remember it.
 static void FindCaptions() {
+    for (auto it = t_caption.begin(); it != t_caption.end();) {
+        auto grid = it->second.grid.get();
+        if (grid && grid.XamlRoot()) {
+            ++it;
+            continue;
+        }
+        if (it->second.src) {
+            try {
+                it->second.src.RegionsChanged(it->second.token);
+            } catch (...) {
+            }
+        }
+        it = t_caption.erase(it);
+    }
     for (auto h : FindNodes(L"MinimizeButton")) {
         InstanceHandle grid = Engine_Parent(h);
         if (Engine_Name(grid) != L"RootGrid" || t_caption.count(grid)) continue;
         auto fe = Obj<mux::FrameworkElement>(grid);
-        if (!fe || !fe.XamlRoot()) continue;
+        if (!fe) continue;
+        auto root = fe.XamlRoot();
+        if (!root) continue;
         CaptionState c;
         c.grid = winrt::make_weak(fe);
         try {
-            auto id = fe.XamlRoot().ContentIslandEnvironment().AppWindowId();
-            c.src = mui::InputNonClientPointerSource::GetForWindowId(id);
+            auto environment = root.ContentIslandEnvironment();
+            if (environment) c.src = mui::InputNonClientPointerSource::GetForWindowId(environment.AppWindowId());
         } catch (...) {
         }
         Log("window buttons: found grid, region source %s", c.src ? "ok" : "missing");
@@ -3253,8 +3273,6 @@ static void FindCaptions() {
             });
         }
     }
-    for (auto it = t_caption.begin(); it != t_caption.end();)
-        it = it->second.grid.get() ? std::next(it) : t_caption.erase(it);
 }
 
 // Show or hide one window's buttons; `animate` fades them along with the toolbar slide.
@@ -3289,7 +3307,13 @@ static void SetCaptionHidden(CaptionState& c, bool hide, bool animate) {
 // screen the window has square corners, so Close does too.
 static bool WindowFillsScreen(const mux::FrameworkElement& el) {
     try {
-        auto id = el.XamlRoot().ContentIslandEnvironment().AppWindowId();
+        // An element can outlive its window and lose its XAML root during teardown.
+        if (!el) return false;
+        auto root = el.XamlRoot();
+        if (!root) return false;
+        auto environment = root.ContentIslandEnvironment();
+        if (!environment) return false;
+        auto id = environment.AppWindowId();
         HWND top = GetAncestor((HWND)(uintptr_t)id.Value, GA_ROOT);
         if (!top) return false;
         if (IsZoomed(top)) return true;
@@ -3352,9 +3376,11 @@ static void UpdateCaptionButtons(const std::function<bool(const mux::FrameworkEl
     for (auto& [h, c] : t_caption) {
         auto fe = c.grid.get();
         if (!fe) continue;
+        auto root = fe.XamlRoot();
+        if (!root) continue;
         double barH = 0;  // this window's toolbar strip
         for (auto bh : FindNodes(L"NavigationBarHost"))
-            if (auto bar = Obj<mux::FrameworkElement>(bh); bar && bar.XamlRoot() == fe.XamlRoot() && bar.ActualHeight() > 1) {
+            if (auto bar = Obj<mux::FrameworkElement>(bh); bar && bar.XamlRoot() == root && bar.ActualHeight() > 1) {
                 barH = bar.ActualHeight();
                 break;
             }
@@ -3641,6 +3667,7 @@ static void UpdateCaptionTrim() {
         auto grid = c.grid.get();
         if (!grid || !c.src) continue;
         auto root = grid.XamlRoot();
+        if (!root) continue;
         bool hiddenBar = false;
         double left = 0;
         for (auto& [bh, a] : t_bars) {
