@@ -387,6 +387,8 @@ static int ChoiceIndex(const std::wstring& key) {
     return 0;
 }
 
+static bool RunToolWindow(const std::wstring& args);
+
 static mux::FrameworkElement Row(const TweakInfo& t) {
     muxc::Grid row;
     row.Padding({12, 8, 12, 8});
@@ -431,6 +433,14 @@ static mux::FrameworkElement Row(const TweakInfo& t) {
     controls.Spacing(12);
     controls.VerticalAlignment(mux::VerticalAlignment::Center);
     std::wstring key = t.key;
+    if (key == L"localBrowsing") {
+        muxc::Button restart;
+        restart.Content(box_value(L"Restart Dia"));
+        winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(restart, L"patch_localBrowsing_restart");
+        winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(restart, L"Restart Dia");
+        restart.Click([](auto&&, auto&&) { RunToolWindow(L"restart"); });
+        controls.Children().Append(restart);
+    }
 
     bool choiceSwitch = ChoiceIsSwitch(t);
     if (!t.choices.empty()) {
@@ -568,7 +578,7 @@ static void ApplyPreset(const std::wstring& preset) {
                                                L"hideChatButton", L"hideTabHoverCard",    L"windowMaterial"};
     std::vector<std::pair<std::wstring, bool>> states;
     for (auto& t : Engine_Tweaks())
-        if (t.key != L"preset" && t.key != L"checkForUpdates")  // a setting, not a patch
+        if (t.key != L"preset" && t.key != L"checkForUpdates" && t.key != L"localBrowsing")
             states.push_back({t.key, preset == L"arc" && arc.count(t.key) > 0});
     if (preset == L"arc") values.push_back({L"windowMaterial", L"acrylic"});
     Engine_SetMany(states, values);
@@ -1031,10 +1041,10 @@ static mux::FrameworkElement BuildPage() {
 
     stack.Children().Append(Section(
         L"DiaTweaks",
-        {ButtonRow(L"", L"Turn off all patches", L"Dia goes back to how it looks without DiaTweaks.",
-                   L"Turn all off", [] { ApplyPreset(L"none"); }),
+        {ButtonRow(L"", L"Turn off visual patches", L"Restores Dia's appearance. Browsing and update settings are kept.",
+                   L"Turn visuals off", [] { ApplyPreset(L"none"); }),
          ButtonRow(L"", L"DiaTweaks for Windows",
-                   L"Unofficial. Not affiliated with The Browser Company. Changes only how Dia looks; "
+                   L"Unofficial. Not affiliated with The Browser Company. Changes Dia while it runs; "
                    L"nothing in Dia's install folder is modified. Config: " +
                        Engine_Dir() + L"\\tweaks.conf",
                    L"Open folder", [] {

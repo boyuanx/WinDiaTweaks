@@ -30,6 +30,7 @@
 #include <winrt/Windows.Web.Http.Headers.h>
 
 #include "shared.h"
+#include "local_browsing.h"
 #include "version.h"  // bin\version.h, written by build.cmd
 #ifndef WDT_VERSION
 #define WDT_VERSION L"dev"
@@ -216,7 +217,8 @@ static bool LaunchTweaked() {
     std::wstring cwd = exe.substr(0, exe.find_last_of(L'\\'));
     STARTUPINFOW si{sizeof(si)};
     PROCESS_INFORMATION pi{};
-    std::vector<wchar_t> buf(exe.begin(), exe.end());
+    std::wstring command = L"\"" + exe + L"\"";
+    std::vector<wchar_t> buf(command.begin(), command.end());
     buf.push_back(0);
     BOOL ok = CreateProcessW(exe.c_str(), buf.data(), nullptr, nullptr, FALSE, 0, nullptr, cwd.c_str(),
                              &si, &pi);
@@ -301,8 +303,12 @@ static int SetTweak(const std::wstring& which, bool on) {
     auto tweaks = ParseTweaks(lines);
     std::wstring w = Lower(which);
     bool hit = false;
+    bool startupChanged = false;
     for (auto& t : tweaks) {
         if (w != L"all" && Lower(t.key) != w && Lower(t.title) != w) continue;
+        // The sign-in bypass is an explicit opt-in, independent of visual patches.
+        if (w == L"all" && on && t.key == L"localBrowsing") continue;
+        if (t.key == L"localBrowsing" && t.on != on) startupChanged = true;
         lines[t.line] = "[" + N(t.key) + "] " + (on ? "on" : "off");
         wprintf(L"%ls %ls\n", on ? L"Enabled " : L"Disabled", t.key.c_str());
         hit = true;
@@ -312,9 +318,12 @@ static int SetTweak(const std::wstring& which, bool on) {
         return 1;
     }
     std::ofstream out(g_dir + L"\\tweaks.conf", std::ios::binary);
+    if (!out) return fwprintf(stderr, L"Could not write tweaks.conf.\n"), 1;
     for (auto& l : lines) out << l << "\n";
     out.close();
+    if (!out) return fwprintf(stderr, L"Could not save tweaks.conf.\n"), 1;
     Signal(DT_EVENT_RELOAD);
+    if (startupChanged) wprintf(L"Restart Dia to apply the forced sign-in bypass: diatweaks restart\n");
     return 0;
 }
 
@@ -354,8 +363,48 @@ static void CloseDia() {
 
 // Start a tweaked Dia, closing any plain instance first. Returns the tapped pid (0 on failure).
 static DWORD StartTweaked(bool quiet) {
+    struct LaunchLock {
+        HANDLE handle = CreateMutexW(nullptr, FALSE, L"Local\\WinDiaTweaks_Launch");
+        bool owned = false;
+        LaunchLock() {
+            if (handle) {
+                DWORD wait = WaitForSingleObject(handle, 0);
+                owned = wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED;
+            }
+        }
+        ~LaunchLock() { if (owned) ReleaseMutex(handle); if (handle) CloseHandle(handle); }
+    } launch;
+    if (!launch.owned) {
+        fwprintf(stderr, L"Another Dia launch is in progress. Wait for it to finish.\n");
+        return 0;
+    }
+    bool localBrowsing = false;
+    for (auto& t : ParseTweaks(ReadLines()))
+        if (t.key == L"localBrowsing") localBrowsing = t.on;
+    int quickExits = 0;
+    { std::ifstream state(g_dir + L"\\launch.state"); state >> quickExits; }
+    if (localBrowsing && quickExits >= 2) {
+        fwprintf(stderr, L"Safe mode: the forced sign-in bypass is skipped with the other tweaks.\n");
+        localBrowsing = false;
+    }
+    std::wstring localExe;
+    if (localBrowsing) {
+        localExe = DiaExePath();
+        std::wstring message;
+        if (!local_browsing::CheckSupported(localExe, message)) {
+            fwprintf(stderr, L"Forced sign-in bypass could not start: %ls\n", message.c_str());
+            return 0;
+        }
+    }
     CloseDia();
-    if (!LaunchTweaked()) return 0;
+    if (localBrowsing) {
+        auto result = local_browsing::Launch(localExe);
+        if (result.status != local_browsing::LaunchStatus::Started) {
+            fwprintf(stderr, L"Forced sign-in bypass could not start: %ls\n", result.message.c_str());
+            return 0;
+        }
+        if (!quiet) wprintf(L"Forced sign-in bypass enabled for this Dia process.\n");
+    } else if (!LaunchTweaked()) return 0;
 
     DWORD pid = 0;
     for (int i = 0; i < 160 && !pid; i++) {
@@ -1072,7 +1121,7 @@ static void Usage() {
         L"  diatweaks update [what]   install updates: dia, tweaks, or both (the default)\n"
         L"  diatweaks version         show this WinDiaTweaks version\n\n"
         L"Every tweak can also be switched in Dia: Settings > Patches.\n"
-        L"Tweaks that are on apply the moment Dia starts, and live-reload on enable/disable.\n");
+        L"Visual tweaks reload instantly. The forced sign-in bypass requires a restart.\n");
 }
 
 int wmain(int argc, wchar_t** argv) {
@@ -1093,7 +1142,10 @@ int wmain(int argc, wchar_t** argv) {
     if (cmd == L"merge-conf" && argc > 3) return MergeConfFiles(argv[2], argv[3]) ? 0 : 1;
     if (cmd == L"apply" || cmd == L"launch" || cmd == L"restart") CleanUpAfterUpdate();
     if (cmd == L"apply") return CmdApply();
-    if (cmd == L"launch" || cmd == L"restart") return StartTweaked(false) ? 0 : 1;
+    if (cmd == L"launch" || cmd == L"restart") {
+        int result = StartTweaked(false) ? 0 : 1;
+        return cmd == L"restart" ? Finish(result) : result;
+    }
     if (cmd == L"list") return ListTweaks(), 0;
     if (cmd == L"status") return CmdStatus();
     if (cmd == L"dump") return CmdDump();
