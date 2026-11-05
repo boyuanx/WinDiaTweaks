@@ -961,9 +961,19 @@ static mux::FrameworkElement UpdatesSection(NavHook& hook) {
 static void SyncUpdates() {
     MaybeAutoCheck();
     int gen = g_updGen;
-    for (auto& h : t_navs)
-        if (h.updatesHost && unbox_value_or<int>(h.updatesHost.Tag(), -1) != gen)
+    for (auto& h : t_navs) {
+        if (!h.updatesHost || unbox_value_or<int>(h.updatesHost.Tag(), -1) == gen) continue;
+        // Only the Patches page on screen; a hidden one is rebuilt when it's shown again.
+        auto nav = h.nav.get();
+        if (!nav || !h.page || nav.Content() != h.page) continue;
+        try {
             FillUpdates(h.updatesHost);
+        } catch (...) {
+            // Don't retry every tick (and starve the badge below); try again on the next change.
+            Log("updates: can't redraw the Updates section");
+            h.updatesHost.Tag(box_value(gen));
+        }
+    }
     UpdateState u = UpdateSnapshot();
     int count = (u.found["dia.available"] == L"1") + (u.found["tweaks.available"] == L"1");
     for (auto& h : t_navs) {
