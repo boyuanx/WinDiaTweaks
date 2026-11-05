@@ -30,7 +30,7 @@ set FLAGS=/nologo /utf-8 /std:c++20 /O2 /EHsc /W3 /DUNICODE /D_UNICODE /D_CRT_SE
 rem C++/WinRT headers for Dia's WinUI live in gen\ (made from Dia's own .winmd files by gen-winrt.cmd).
 if not exist gen\winrt\Microsoft.UI.Xaml.Controls.h call "%~dp0gen-winrt.cmd" || exit /b 1
 for /f "delims=" %%v in ('dir /b /ad /o-n "%ProgramFiles(x86)%\Windows Kits\10\Include\10.*" 2^>nul') do if not defined SDKV set "SDKV=%%v"
-cl %FLAGS% /bigobj /Zi /I gen /I "%ProgramFiles(x86)%\Windows Kits\10\Include\%SDKV%\cppwinrt" /LD src\tap.cpp src\ui.cpp src\peek.cpp /Fobin\ /Febin\DiaTweaksTap.dll /link /DEBUG /OPT:REF /DEF:src\tap.def ole32.lib oleaut32.lib user32.lib gdi32.lib shell32.lib windowsapp.lib dwmapi.lib comctl32.lib msimg32.lib d3d11.lib dcomp.lib || exit /b 1
+cl %FLAGS% /bigobj /Zi /I gen /I "%ProgramFiles(x86)%\Windows Kits\10\Include\%SDKV%\cppwinrt" /LD src\tap.cpp src\ui.cpp src\peek.cpp /Fobin\ /Febin\DiaTweaksTap.dll /link /DEBUG /OPT:REF /DEF:src\tap.def ole32.lib oleaut32.lib user32.lib gdi32.lib shell32.lib windowsapp.lib dwmapi.lib comctl32.lib msimg32.lib d3d11.lib dcomp.lib d2d1.lib || exit /b 1
 cl %FLAGS% /I bin /I "%ProgramFiles(x86)%\Windows Kits\10\Include\%SDKV%\cppwinrt" src\diatweaks.cpp /Fobin\ /Febin\diatweaks.exe /link ole32.lib user32.lib shell32.lib windowsapp.lib || exit /b 1
 rem bin\tweaks.conf also holds your on/off choices: bring in new and changed tweaks, keep your choices.
 if exist bin\tweaks.conf (bin\diatweaks.exe merge-conf tweaks.conf bin\tweaks.conf >nul || exit /b 1) else copy /y tweaks.conf bin\tweaks.conf >nul

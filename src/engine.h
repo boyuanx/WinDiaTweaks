@@ -14,6 +14,7 @@ struct TweakInfo {
     std::wstring key, title, desc, section, icon, value;
     std::vector<std::pair<std::wstring, std::wstring>> choices;  // value -> label
     bool enabled = false;
+    bool noSwitch = false;  // "switch: none": its drop-down only (an option of another tweak)
 };
 
 // ---- provided by tap.cpp
@@ -63,12 +64,16 @@ std::wstring Ui_HoveredLink(HWND top);
 
 // Peek's preview window (or null): the toolbar-hiding tweaks leave its toolbar alone.
 void Ui_SetPeekWindow(HWND w);
+// Peek's preview window: no resizing, maximizing or minimizing (false until WinUI has its AppWindow).
+bool Ui_PeekFixedSize(HWND w);
 
-void Ui_PeekProbe();  // TEMP
 // Peek "open as tab": where a window's tab row is (screen pixels), and, with its tab menu open, Dia's
 // "Move to Window" to the window `to` (1 done, 0 menu not open yet, -1 can't).
 bool Ui_PeekTabRow(HWND win, RECT& out);
 int Ui_PeekMoveTab(HWND win, HWND to);
+// Peek's split: `win`'s tab titled `title` opened as a split beside the tab it's on (1 done, 0 not yet, -1 can't).
+int Ui_PeekSplitWith(HWND win, const std::wstring& title);
+bool Ui_PeekTabRowNamed(HWND win, const std::wstring& title, RECT& out);
 bool Ui_PeekShowTabMenu(HWND window);
 void Ui_PeekCloseTabMenu(HWND window);
 void Peek_BeforeMove();  // (peek.cpp: just before the tab moves)
