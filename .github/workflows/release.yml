@@ -38,7 +38,7 @@ jobs:
         shell: pwsh
         run: |
           $files = New-Item -ItemType Directory -Force dist/files
-          Copy-Item bin/diatweaks.exe, bin/DiaLauncher.exe, bin/DiaTweaksTap.dll, tweaks.conf, auto-attach.ps1, uninstall.cmd, LICENSE $files
+          Copy-Item bin/diatweaks.exe, bin/DiaLauncher.exe, bin/DiaTweaksTap.dll, tweaks.conf, uninstall.cmd, LICENSE $files
           Compress-Archive -Path "$files/*" -DestinationPath dist/WinDiaTweaks.zip -Force
           Copy-Item scripts/install.ps1 dist/install.ps1
           & bin/diatweaks.exe version

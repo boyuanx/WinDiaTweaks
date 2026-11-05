@@ -105,6 +105,8 @@ static DWORD FindDiaUiPid() {
 
 // Dia's main (browser) process: the Dia.exe not started by another Dia.exe (those are its helper
 // processes). It exists from the first moment Dia starts, long before its window shows.
+// Opening Dia while it's open briefly starts a second such Dia.exe, which hands the request to the
+// open one and exits: when there are several, the one with helper processes is the browser.
 static DWORD FindDiaMainPid() {
     std::map<DWORD, DWORD> dia;  // pid -> parent
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -112,9 +114,15 @@ static DWORD FindDiaMainPid() {
     for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe))
         if (_wcsicmp(pe.szExeFile, L"Dia.exe") == 0) dia[pe.th32ProcessID] = pe.th32ParentProcessID;
     CloseHandle(snap);
-    for (auto& [pid, parent] : dia)
-        if (!dia.count(parent)) return pid;
-    return 0;
+    DWORD best = 0;
+    size_t bestChildren = 0;
+    for (auto& [pid, parent] : dia) {
+        if (dia.count(parent)) continue;  // a helper
+        size_t children = 0;
+        for (auto& [p2, parent2] : dia) children += parent2 == pid;
+        if (!best || children > bestChildren) best = pid, bestChildren = children;
+    }
+    return best;
 }
 
 static std::wstring ProcessPath(DWORD pid) {
@@ -129,7 +137,13 @@ static std::wstring ProcessPath(DWORD pid) {
 }
 
 static bool TapLoaded(DWORD pid) {
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    // While a process is starting its module list can be mid-change: Windows then asks to try again.
+    HANDLE snap = INVALID_HANDLE_VALUE;
+    for (int i = 0; i < 20; i++) {
+        snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+        if (snap != INVALID_HANDLE_VALUE || GetLastError() != ERROR_BAD_LENGTH) break;
+        Sleep(5);
+    }
     if (snap == INVALID_HANDLE_VALUE) return false;
     MODULEENTRY32W me{sizeof(me)};
     bool found = false;
@@ -221,7 +235,14 @@ static bool InjectTap(DWORD pid) {
         if (!th) {
             ok = false;
         } else {
-            WaitForSingleObject(th, 15000);
+            // The thread's exit code is LoadLibraryW's result (its low 32 bits): non-zero means loaded.
+            DWORD loaded = 0;
+            if (WaitForSingleObject(th, 15000) == WAIT_OBJECT_0 && GetExitCodeThread(th, &loaded) && loaded) {
+                CloseHandle(th);
+                VirtualFreeEx(proc, mem, 0, MEM_RELEASE);
+                CloseHandle(proc);
+                return true;
+            }
             CloseHandle(th);
         }
     }
@@ -403,6 +424,7 @@ static int SetTweak(const std::wstring& which, bool on) {
     bool hit = false;
     for (auto& t : tweaks) {
         if (w != L"all" && Lower(t.key) != w && Lower(t.title) != w) continue;
+        if (w == L"all" && t.key == L"normalLaunch") continue;  // a setting, not a patch
         lines[t.line] = "[" + N(t.key) + "] " + (on ? "on" : "off");
         wprintf(L"%ls %ls\n", on ? L"Enabled " : L"Disabled", t.key.c_str());
         hit = true;
@@ -498,10 +520,9 @@ static int CmdApply() {
 
 // Only attach to an existing UI process; normal launches must not be restarted.
 static int CmdAttach() {
-    DWORD pid = FindDiaUiPid();
+    DWORD pid = FindDiaMainPid();
     if (!pid) return 2;
-    if (TapLoaded(pid)) return 0;
-    if (!InjectTap(pid) || !WaitForTap(10)) return 1;
+    if (!EnsureTweaked(pid, 15)) return 1;
     wprintf(L"Tweaks attached to running Dia (pid %lu)\n", pid);
     return 0;
 }
@@ -1155,12 +1176,14 @@ static std::wstring KnownFolder(REFKNOWNFOLDERID id) {
     return r;
 }
 
-static bool SaveShortcut(const std::wstring& lnk, const std::wstring& target, const std::wstring& icon) {
+static bool SaveShortcut(const std::wstring& lnk, const std::wstring& target, const std::wstring& icon,
+                         const wchar_t* args = L"", const wchar_t* desc = L"Open Dia with WinDiaTweaks") {
     IShellLinkW* link = nullptr;
     if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&link)))) return false;
     link->SetPath(target.c_str());
+    link->SetArguments(args);
     link->SetWorkingDirectory(target.substr(0, target.find_last_of(L'\\')).c_str());
-    link->SetDescription(L"Open Dia with WinDiaTweaks");
+    link->SetDescription(desc);
     if (!icon.empty()) link->SetIconLocation(icon.c_str(), 0);
     IPersistFile* file = nullptr;
     bool ok = SUCCEEDED(link->QueryInterface(IID_PPV_ARGS(&file))) && SUCCEEDED(file->Save(lnk.c_str(), TRUE));
@@ -1223,6 +1246,169 @@ static int CmdOpen() {
     return tweaked ? 0 : 1;
 }
 
+// ---------------------------------------------------------------- normal Dia launches
+
+// "Patch Dia however it's opened" (normalLaunch in tweaks.conf, off by default). A small helper,
+// DiaLauncher.exe --watch, runs from sign-in and attaches the tweaks the moment Dia's main process
+// starts, however Dia was opened: its own icon or pin, the Start menu, a link from another app. Like
+// the Dia (Tweaks) shortcut, that's before Dia's window first shows.
+static const wchar_t kNormalLaunch[] = L"normalLaunch";
+
+static bool ConfOn(const wchar_t* key) {
+    for (auto& t : ParseTweaks(ReadLines()))
+        if (t.key == key) return t.on;
+    return false;
+}
+
+static std::wstring WatcherLink() { return KnownFolder(FOLDERID_Startup) + L"\\WinDiaTweaks.lnk"; }
+
+static bool WatcherRunning() {
+    HANDLE m = OpenMutexW(SYNCHRONIZE, FALSE, DT_WATCH_MUTEX);
+    if (m) CloseHandle(m);
+    return m != nullptr;
+}
+
+// Makes the sign-in entry (a shortcut in the Startup folder) and the running helper match the setting,
+// and retires the PowerShell helper this replaces (auto-attach.ps1). Must run outside Dia: Dia's
+// package would keep the entry to itself. Returns false if the entry couldn't be written.
+static bool SyncWatcher(bool startNow) {
+    Signal(L"Local\\WinDiaTweaksAutoAttachStop");
+    DeleteFileW((KnownFolder(FOLDERID_Startup) + L"\\WinDiaTweaks helper.lnk").c_str());
+    std::wstring launcher = g_dir + L"\\DiaLauncher.exe", lnk = WatcherLink();
+    if (!ConfOn(kNormalLaunch)) {
+        DeleteFileW(lnk.c_str());
+        Signal(DT_WATCH_STOP);
+        return true;
+    }
+    bool ok = SaveShortcut(lnk, launcher, L"", L"--watch", L"Adds WinDiaTweaks to Dia however Dia is opened");
+    if (!ok) fwprintf(stderr, L"Couldn't add the WinDiaTweaks helper to sign-in.\n");
+    if (startNow && !WatcherRunning()) Start(launcher, Quote(launcher) + L" --watch");
+    return ok;
+}
+
+// Stops a running helper and waits for it to go, so its files can be replaced.
+static void StopWatcher() {
+    Signal(DT_WATCH_STOP);
+    for (ULONGLONG end = GetTickCount64() + 5000; WatcherRunning() && GetTickCount64() < end;) Sleep(50);
+}
+
+static void WatchLog(const wchar_t* fmt, DWORD pid) {
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    wchar_t line[256];
+    swprintf(line, 256, L"%02u:%02u:%02u ", t.wHour, t.wMinute, t.wSecond);
+    swprintf(line + 9, 247, fmt, pid);
+    std::ofstream out(g_dir + L"\\watch.log", std::ios::app);
+    out << N(line) << "\n";
+}
+
+// When a process started (0 if unknown): tells a new Dia from an old one that had the same id.
+static ULONGLONG ProcessStartTime(DWORD pid) {
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return 0;
+    FILETIME created{}, exited, kernel, user;
+    GetProcessTimes(h, &created, &exited, &kernel, &user);
+    CloseHandle(h);
+    return (ULONGLONG)created.dwHighDateTime << 32 | created.dwLowDateTime;
+}
+
+// Process ids that created a window lately: whether each is Dia.exe, and whether it was looked at.
+enum class SeenPid { other, dia, diaChecked };
+static std::map<DWORD, SeenPid> g_seen;
+static bool g_newDia = false;
+
+// Windows reports every new window (hidden ones too). Dia's main process makes its first hidden windows
+// a fraction of a second after it starts, long before its own window shows, so this tells us a Dia has
+// started without listing every process on the PC several times a second.
+static void CALLBACK OnWindowCreated(HWINEVENTHOOK, DWORD, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD) {
+    if (!hwnd || idObject != OBJID_WINDOW || idChild != CHILDID_SELF) return;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    auto it = g_seen.find(pid);
+    if (it == g_seen.end()) {
+        std::wstring path = Lower(ProcessPath(pid));
+        bool dia = path.size() >= 8 && path.compare(path.size() - 8, 8, L"\\dia.exe") == 0;
+        it = g_seen.emplace(pid, dia ? SeenPid::dia : SeenPid::other).first;
+    }
+    if (it->second == SeenPid::dia) {
+        it->second = SeenPid::diaChecked;  // look once per process, not on every window it makes
+        g_newDia = true;
+    }
+}
+
+// DiaLauncher.exe --watch. Wakes when a Dia process makes its first window (and every 10 s, in case
+// that was missed), and attaches to a Dia it hasn't handled yet; stops when the setting goes off or
+// `diatweaks auto off` asks it to.
+static int CmdWatch() {
+    HANDLE mutex = CreateMutexW(nullptr, FALSE, DT_WATCH_MUTEX);
+    if (!mutex || GetLastError() == ERROR_ALREADY_EXISTS) return 0;  // one helper is enough
+    HANDLE stop = CreateEventW(nullptr, TRUE, FALSE, DT_WATCH_STOP);
+    _wfreopen((g_dir + L"\\watch.log").c_str(), L"a", stderr);  // no console: keep the error messages
+    setvbuf(stderr, nullptr, _IONBF, 0);
+    if (!ConfOn(kNormalLaunch)) return SyncWatcher(false), 0;
+    SyncWatcher(false);  // started from Dia's Settings: add the sign-in entry
+    WatchLog(L"helper started (pid %lu)", GetCurrentProcessId());
+    HWINEVENTHOOK hook = SetWinEventHook(EVENT_OBJECT_CREATE, EVENT_OBJECT_CREATE, nullptr, OnWindowCreated, 0, 0,
+                                         WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    DWORD handled = 0;
+    ULONGLONG handledStart = 0, confCheck = GetTickCount64(), nextPoll = 0;
+    for (;;) {
+        if (MsgWaitForMultipleObjects(1, &stop, FALSE, 1000, QS_ALLINPUT) == WAIT_OBJECT_0) break;
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);  // runs OnWindowCreated
+        ULONGLONG now = GetTickCount64();
+        if (now - confCheck > 2000) {
+            confCheck = now;
+            if (!ConfOn(kNormalLaunch)) break;  // switched off in Settings
+        }
+        bool poll = now >= nextPoll;
+        if (!g_newDia && !poll) continue;
+        g_newDia = false;
+        if (poll) {
+            nextPoll = now + 10000;
+            if (g_seen.size() > 2000) g_seen.clear();  // ids get reused
+        }
+        DWORD pid = FindDiaMainPid();
+        if (!pid) {  // Dia is closed: forget it, as a new Dia may get the same process ids
+            handled = 0;
+            for (auto it = g_seen.begin(); it != g_seen.end();)
+                it = it->second == SeenPid::other ? std::next(it) : g_seen.erase(it);
+            continue;
+        }
+        ULONGLONG started = ProcessStartTime(pid);
+        if (pid == handled && started == handledStart) continue;
+        handled = pid, handledStart = started;  // one go per Dia: it retries inside, and a failure shouldn't loop
+        if (EnsureTweaked(pid, 40)) WatchLog(L"tweaks attached to Dia (pid %lu)", pid);
+        else WatchLog(L"tweaks didn't attach to Dia (pid %lu), see tap.log", pid);
+    }
+    if (hook) UnhookWinEvent(hook);
+    if (!ConfOn(kNormalLaunch)) DeleteFileW(WatcherLink().c_str());
+    WatchLog(L"helper stopped (pid %lu)", GetCurrentProcessId());
+    CloseHandle(stop);
+    CloseHandle(mutex);
+    return 0;
+}
+
+// `diatweaks auto on|off|status`.
+static int CmdAuto(const std::wstring& what) {
+    if (what == L"on" || what == L"off") {
+        if (int r = SetTweak(kNormalLaunch, what == L"on")) return r;
+        if (!SyncWatcher(true)) return 1;
+        if (what == L"off") StopWatcher();  // report the helper's state once it has settled
+        for (ULONGLONG end = GetTickCount64() + 3000; what == L"on" && !WatcherRunning() && GetTickCount64() < end;)
+            Sleep(50);
+    } else if (what != L"status") {
+        fwprintf(stderr, L"Use: diatweaks auto on|off|status\n");
+        return 1;
+    }
+    bool on = ConfOn(kNormalLaunch);
+    wprintf(L"Patch Dia however it's opened: %ls\n", on ? L"on" : L"off");
+    wprintf(L"  helper running:   %ls\n", WatcherRunning() ? L"yes" : L"no");
+    wprintf(L"  starts at sign-in: %ls\n",
+            GetFileAttributesW(WatcherLink().c_str()) != INVALID_FILE_ATTRIBUTES ? L"yes" : L"no");
+    return 0;
+}
+
 // Copy, or when the file is in use (a DLL Dia still has loaded) move it aside first.
 static bool Replace(const std::wstring& from, const std::wstring& to) {
     for (int i = 0; i < 20; i++) {
@@ -1262,7 +1448,8 @@ static int CmdInstall(int argc, wchar_t** argv) {
     wprintf(L"Installing WinDiaTweaks %ls in %ls...\n", WDT_VERSION, to.c_str());
     SHCreateDirectoryExW(nullptr, to.c_str(), nullptr);
     CloseDia();
-    for (const wchar_t* name : {L"diatweaks.exe", L"DiaLauncher.exe", L"DiaTweaksTap.dll", L"auto-attach.ps1", L"uninstall.cmd", L"LICENSE"}) {
+    StopWatcher();  // it keeps DiaLauncher.exe in use
+    for (const wchar_t* name : {L"diatweaks.exe", L"DiaLauncher.exe", L"DiaTweaksTap.dll", L"uninstall.cmd", L"LICENSE"}) {
         std::wstring from = g_dir + L"\\" + name;
         if (GetFileAttributesW(from.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
         if (!Replace(from, to + L"\\" + name)) {
@@ -1276,6 +1463,9 @@ static int CmdInstall(int argc, wchar_t** argv) {
         return 1;
     }
     CreateShortcuts(to, false);
+    DeleteFileW((to + L"\\auto-attach.ps1").c_str());  // replaced by DiaLauncher.exe --watch
+    std::wstring tool = to + L"\\diatweaks.exe";
+    RunAndWait(tool, Quote(tool) + L" sync-helper");  // start the new helper, if the setting is on
     wprintf(L"Opening Dia with WinDiaTweaks %ls...\n", WDT_VERSION);
     std::wstring exe = to + L"\\diatweaks.exe";
     DWORD code = 1;
@@ -1307,6 +1497,7 @@ static void Usage() {
         L"  diatweaks                 start Dia with tweaks (or reload if already tweaked)\n"
         L"  diatweaks restart         close Dia and start it again with tweaks\n"
         L"  diatweaks attach          attach to running Dia without restarting it\n"
+        L"  diatweaks auto on|off     add the tweaks however Dia is opened (a helper runs from sign-in)\n"
         L"  diatweaks list            show tweaks and whether they're on\n"
         L"  diatweaks enable <name>   turn a tweak on (name or 'all')\n"
         L"  diatweaks disable <name>  turn a tweak off\n"
@@ -1333,6 +1524,7 @@ int wmain(int argc, wchar_t** argv) {
     CoInitializeEx(nullptr, winrtCmd ? COINIT_MULTITHREADED : COINIT_APARTMENTTHREADED);
 
 #ifdef WDT_LAUNCHER
+    if (cmd == L"--watch") return CmdWatch();
     // DiaLauncher.exe: no console. Says what went wrong in a message box, as nothing shows its output.
     if (argc < 2) {
         CleanUpAfterUpdate();
@@ -1354,6 +1546,9 @@ int wmain(int argc, wchar_t** argv) {
     if (cmd == L"apply" || cmd == L"launch" || cmd == L"restart") CleanUpAfterUpdate();
     if (cmd == L"apply") return CmdApply();
     if (cmd == L"attach") return CmdAttach();
+    if (cmd == L"auto") return CmdAuto(argc > 2 ? Lower(argv[2]) : L"status");
+    if (cmd == L"sync-helper") return SyncWatcher(true) ? 0 : 1;
+    if (cmd == L"stop-helper") return StopWatcher(), 0;
     if (cmd == L"launch" || cmd == L"restart") return StartTweaked(false) ? 0 : 1;
     if (cmd == L"open") return CmdOpen();
     if (cmd == L"shortcuts") return CreateShortcuts(g_dir, !(argc > 2 && Lower(argv[2]) == L"--update")) ? 0 : 1;
@@ -1365,7 +1560,9 @@ int wmain(int argc, wchar_t** argv) {
     if ((cmd == L"enable" || cmd == L"disable") && argc > 2) {
         std::wstring name = argv[2];
         for (int i = 3; i < argc; i++) name += std::wstring(L" ") + argv[i];
+        bool wasAuto = ConfOn(kNormalLaunch);
         int r = SetTweak(name, cmd == L"enable");
+        if (!r && ConfOn(kNormalLaunch) != wasAuto) SyncWatcher(true);
         if (!r) {
             DWORD pid = FindDiaUiPid();
             if (pid && TapLoaded(pid)) Signal(DT_EVENT_RELOAD);

@@ -80,23 +80,35 @@ Prefer to compile it from the code here?
 
 It builds WinDiaTweaks on your PC, adds **Dia (Tweaks)** to the Start menu and the desktop and reopens Dia with the tweaks. At the end it asks whether you'd like to star the repo (y/n): with the [GitHub CLI](https://cli.github.com) signed in it stars it for you, otherwise it opens the repo page. Open Dia from **Dia (Tweaks)** from now on, then go to **Settings → Patches**.
 
-### Optional: use your normal Dia launcher
+## Two ways to open Dia with the tweaks
 
-An opt-in sign-in helper can load patches when you open Dia normally. In PowerShell,
-from the WinDiaTweaks folder:
+The tweaks have to be added each time Dia starts. Pick how:
+
+| | **Dia (Tweaks)** shortcut (the default) | **Normal Dia** (opt-in) |
+|---|---|---|
+| How you open Dia | **Dia (Tweaks)** in the Start menu or on the desktop | Any way: Dia's own icon or pin, the Start menu, a link from another app |
+| Runs in the background | Nothing | A small helper (`DiaLauncher.exe`), from sign-in |
+| Tweaks show | From Dia's first frame | From Dia's first frame |
+| Opening Dia any other way | Plain Dia, no tweaks | Tweaks too |
+| Turn on | Nothing to do | **Settings → Patches → Opening Dia → Patch Dia however it's opened**, or `diatweaks auto on` |
+
+### Dia (Tweaks) shortcut
+
+What you get after installing. Open Dia from **Dia (Tweaks)**: it starts Dia the way the Start menu does, adds the tweaks while Dia is starting, and closes. Dia opens as fast as without WinDiaTweaks and comes to the front. If Dia is already open, it brings Dia forward, and adds the tweaks if they're missing. Nothing keeps running; open Dia any other way (its own icon, or a link from another app when Dia is your default browser) and you get plain Dia.
+
+Pin **Dia (Tweaks)** to the taskbar instead of Dia if you use the taskbar.
+
+### Normal Dia
+
+For when you'd rather keep opening Dia the usual way, or Dia is your default browser and opens from links. Switch on **Patch Dia however it's opened** in **Settings → Patches → Opening Dia**, or in PowerShell:
 
 ```powershell
-.\auto-attach.ps1 -Install      # Source installation
-# For a prebuilt installation, use: .\bin\auto-attach.ps1 -Install
+& "$HOME\WinDiaTweaks\bin\diatweaks.exe" auto on
 ```
 
-The helper starts now and at sign-in. It checks once per second, attaches to an
-existing Dia window and never opens or restarts the browser. It does not create
-another browser profile or change your existing launch shortcuts.
+A small helper, `DiaLauncher.exe --watch`, then runs from sign-in (it's in your Startup folder as **WinDiaTweaks**). It notices Dia the moment it starts, however it was opened, and adds the tweaks before Dia's window shows. It never opens, closes or restarts Dia and needs no administrator rights. It waits for Windows to report new windows rather than checking constantly: about 17 MB of memory and well under 1% of one CPU core. Problems are written to `bin\watch.log`.
 
-Run the same script with `-Disable` to stop it and remove its sign-in entry. The
-entry is backed up, not deleted. Failures are recorded in `bin\auto-attach.log`.
-Uninstalling WinDiaTweaks disables the helper too. No administrator rights are needed.
+Switch it off the same way, or with `diatweaks auto off`: the helper stops and leaves sign-in. `diatweaks auto status` shows whether it's on and running. **Dia (Tweaks)** keeps working either way.
 
 ## The `diatweaks` command
 
@@ -111,6 +123,7 @@ Uninstalling WinDiaTweaks disables the helper too. No administrator rights are n
 | `diatweaks status` | Shows whether Dia is running with the tweaks, and which are on |
 | `diatweaks restart` | Closes Dia and opens it again with the tweaks |
 | `diatweaks attach` | Loads patches into running Dia without opening or restarting it |
+| `diatweaks auto on` | Adds the tweaks however Dia is opened ([Normal Dia](#normal-dia)); `auto off` stops that, `auto status` shows it |
 | `diatweaks shortcuts` | Adds **Dia (Tweaks)**, with Dia's icon, to the Start menu and the desktop again |
 | `diatweaks check` | Shows the installed and newest versions of Dia and WinDiaTweaks |
 | `diatweaks update` | Installs updates to Dia and WinDiaTweaks (or `update dia`, `update tweaks`) |
@@ -157,9 +170,9 @@ Nothing in Dia's install folder is changed. `diatweaks.exe` opens Dia and loads 
 <details>
 <summary><strong>Does it run in the background?</strong></summary>
 
-Not by default. Nothing stays running after you close Dia, and nothing starts with Windows. If you open Dia some other way than **Dia (Tweaks)** or `diatweaks`, you simply get Dia without the tweaks.
+Not by default. With the **Dia (Tweaks)** shortcut nothing stays running after you close Dia, and nothing starts with Windows. If you open Dia some other way than **Dia (Tweaks)** or `diatweaks`, you simply get Dia without the tweaks.
 
-If you enable the [optional sign-in helper](#optional-use-your-normal-dia-launcher), that helper stays running and loads patches when Dia opens normally. Run its `-Disable` option to turn this off.
+If you switch on [Normal Dia](#normal-dia), one small helper runs from sign-in so the tweaks are added however Dia opens. Switch it off and it stops.
 
 </details>
 
@@ -179,7 +192,7 @@ WinDiaTweaks watches for that: after two launches in a row where Dia closes almo
 
 ## Uninstall
 
-Run `uninstall.cmd` in the WinDiaTweaks folder (`bin` for an installed release). It removes the Start menu and desktop shortcuts and reopens Dia without the tweaks. Then delete the folder.
+Run `uninstall.cmd` in the WinDiaTweaks folder (`bin` for an installed release). It removes the Start menu and desktop shortcuts, stops the Normal Dia helper and removes it from sign-in, and reopens Dia without the tweaks. Then delete the folder.
 
 ## Credits
 

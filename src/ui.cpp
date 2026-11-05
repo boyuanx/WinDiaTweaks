@@ -568,7 +568,7 @@ static void ApplyPreset(const std::wstring& preset) {
                                                L"hideChatButton", L"hideTabHoverCard",    L"windowMaterial"};
     std::vector<std::pair<std::wstring, bool>> states;
     for (auto& t : Engine_Tweaks())
-        if (t.key != L"preset" && t.key != L"checkForUpdates")  // a setting, not a patch
+        if (t.key != L"preset" && t.key != L"checkForUpdates" && t.key != L"normalLaunch")  // settings, not patches
             states.push_back({t.key, preset == L"arc" && arc.count(t.key) > 0});
     if (preset == L"arc") values.push_back({L"windowMaterial", L"acrylic"});
     Engine_SetMany(states, values);

@@ -15,12 +15,18 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
 
+#include <exdisp.h>
+#include <shldisp.h>
+#include <shlobj.h>
+
 #include "engine.h"
 #include "shared.h"
+#pragma comment(lib, "uuid.lib")
 
 // ---------------------------------------------------------------- utils
 
@@ -938,14 +944,76 @@ static void SetInLines(std::vector<std::string>& lines, const std::wstring& key,
     }
 }
 
+// Starts a program as Explorer's child rather than ours (through the desktop's shell view), so it runs
+// outside Dia's package: it outlives Dia, and what it writes, like a sign-in entry, isn't kept inside
+// the package.
+static bool RunViaExplorer(const std::wstring& exe, const std::wstring& args) {
+    bool ok = false;
+    IShellWindows* windows = nullptr;
+    IDispatch *desktop = nullptr, *viewDisp = nullptr, *app = nullptr;
+    IServiceProvider* sp = nullptr;
+    IShellBrowser* browser = nullptr;
+    IShellView* view = nullptr;
+    IShellFolderViewDual* folderView = nullptr;
+    IShellDispatch2* shell = nullptr;
+    VARIANT loc, empty;
+    VariantInit(&loc);
+    VariantInit(&empty);
+    loc.vt = VT_I4;
+    loc.lVal = CSIDL_DESKTOP;
+    long hwnd = 0;
+    if (SUCCEEDED(CoCreateInstance(CLSID_ShellWindows, nullptr, CLSCTX_LOCAL_SERVER, IID_PPV_ARGS(&windows))) &&
+        windows->FindWindowSW(&loc, &empty, SWC_DESKTOP, &hwnd, SWFO_NEEDDISPATCH, &desktop) == S_OK &&
+        SUCCEEDED(desktop->QueryInterface(IID_PPV_ARGS(&sp))) &&
+        SUCCEEDED(sp->QueryService(SID_STopLevelBrowser, IID_PPV_ARGS(&browser))) &&
+        SUCCEEDED(browser->QueryActiveShellView(&view)) &&
+        SUCCEEDED(view->GetItemObject(SVGIO_BACKGROUND, IID_PPV_ARGS(&viewDisp))) &&
+        SUCCEEDED(viewDisp->QueryInterface(IID_PPV_ARGS(&folderView))) && SUCCEEDED(folderView->get_Application(&app)) &&
+        SUCCEEDED(app->QueryInterface(IID_PPV_ARGS(&shell)))) {
+        BSTR file = SysAllocString(exe.c_str());
+        VARIANT vArgs, vDir, vOp, vShow;
+        VariantInit(&vArgs);
+        VariantInit(&vDir);
+        VariantInit(&vOp);
+        VariantInit(&vShow);
+        vArgs.vt = VT_BSTR;
+        vArgs.bstrVal = SysAllocString(args.c_str());
+        vDir.vt = VT_BSTR;
+        vDir.bstrVal = SysAllocString(g_dir.c_str());
+        vShow.vt = VT_I4;
+        vShow.lVal = SW_SHOWNORMAL;
+        ok = SUCCEEDED(shell->ShellExecute(file, vArgs, vDir, vOp, vShow));
+        SysFreeString(file);
+        VariantClear(&vArgs);
+        VariantClear(&vDir);
+    }
+    for (IUnknown* p : std::initializer_list<IUnknown*>{shell, app, folderView, viewDisp, view, browser, sp, desktop, windows})
+        if (p) p->Release();
+    return ok;
+}
+
+// "Patch Dia however it's opened" switched on in Settings: start its helper (it adds itself to
+// sign-in). Switched off, the helper sees the setting change, removes its sign-in entry and stops.
+static void StartWatcher() {
+    std::thread([] {
+        CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        std::wstring exe = g_dir + L"\\DiaLauncher.exe";
+        bool ok = RunViaExplorer(exe, L"--watch");
+        Log("normal launches: helper %s", ok ? "started" : "couldn't be started through Explorer");
+        CoUninitialize();
+    }).detach();
+}
+
 void Engine_SetTweak(const std::wstring& key, bool on, const std::wstring* value) {
     auto lines = ReadConfLines();
     SetInLines(lines, key, &on, value);
     // Changing one patch by hand leaves the preset: it becomes Custom.
     static const std::wstring custom = L"custom";
-    if (key != L"preset" && key != L"checkForUpdates") SetInLines(lines, L"preset", nullptr, &custom);
+    if (key != L"preset" && key != L"checkForUpdates" && key != L"normalLaunch")
+        SetInLines(lines, L"preset", nullptr, &custom);
     WriteConfLines(lines);
     ApplyConfigNow();
+    if (key == L"normalLaunch" && on) StartWatcher();
 }
 
 void Engine_SetMany(const std::vector<std::pair<std::wstring, bool>>& states,
