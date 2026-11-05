@@ -2272,7 +2272,8 @@ static void UpdateArcLabel(ArcState& st) {
     url.UpdateLayout();  // after a tab switch the new tab's chip/buttons must be measured before we place the label
     double left = 12, right = 12;
     try {
-        left = reb.TransformToVisual(url).TransformPoint({0, 0}).X + reb.Padding().Left + 1;
+        // Never closer to the pill's edge than on the right.
+        left = (std::max)(12.0, reb.TransformToVisual(url).TransformPoint({0, 0}).X + reb.Padding().Left + 1);
         auto host = FindByName(url, L"AssistantBarHost");
         auto trailing = host ? FindByName(host, L"UrlBarTrailingStack") : nullptr;
         if (!st.hover)
@@ -2471,13 +2472,20 @@ static void BuildArcRows(ArcState& st, const muxc::Grid& paging) {
 // appears, so this runs on every pass until it finds the field.
 static void AttachDisplay(ArcState& st, const mux::FrameworkElement& address) {
     if (!address) return;
+    auto d = FindByName(address, L"AddressRichEditBox");
     auto cur = st.display.get();
+    // Dia rebuilds the field when a tab navigates (e.g. a new tab leaving its start page). The old box
+    // can still report the pill as an ancestor, so compare with the box that's in the pill now: holding
+    // on to the old one leaves Dia's new text showing under a stale label.
+    if (cur && cur == d) return;
     if (cur) {
-        // Still the field inside the pill?
-        for (mux::DependencyObject d = cur; d; d = muxm::VisualTreeHelper::GetParent(d))
-            if (d == address) return;
+        st.display = nullptr;  // first: our opacity watch would hide it again
+        cur.Opacity(st.displayOpacity);
+        cur.Clip(st.displayClip);
+        cur.IsHitTestVisible(st.displayHit);
+        if (auto c = cur.try_as<muxc::Control>()) c.IsTabStop(st.displayTab);
     }
-    if (auto d = FindByName(address, L"AddressRichEditBox")) {
+    if (d) {
         st.display = winrt::make_weak(d);
         st.displayOpacity = d.Opacity();
         d.Opacity(0);  // our domain-only label shows instead (UpdateArcLabel)
@@ -2671,6 +2679,13 @@ static bool SidebarDocked(const mux::XamlRoot& root) {
         auto sb = Obj<mux::FrameworkElement>(h);
         if (!sb || sb.XamlRoot() != root) continue;
         if (!ShownOnScreen(sb) || sb.ActualWidth() < 1) return false;  // closed
+        // Floating out over the page, Dia shows the sidebar in a popup of its own, outside the window's
+        // tree (and drawn above all of it).
+        auto top = [](mux::DependencyObject d) {
+            while (auto p = muxm::VisualTreeHelper::GetParent(d)) d = p;
+            return d;
+        };
+        if (auto content = root.Content(); content && top(sb) != top(content)) return false;
         auto host = muxm::VisualTreeHelper::GetParent(sb);
         auto floating = host ? FindVisual(host, [](const mux::DependencyObject& d) {
             auto fe = d.try_as<mux::FrameworkElement>();
@@ -2825,7 +2840,12 @@ static void UpdateArcBar() {
         auto paging = Obj<muxc::Grid>(h);
         if (!paging) continue;
         auto& st = t_arc[h];
-        if (!st.bar.get()) BuildArcRows(st, paging);
+        if (!st.bar.get()) {
+            // Dia can show a sidebar that doesn't have its usual rows (yet); adding ours there would throw
+            // on every pass and stop every other tweak from updating.
+            if (paging.RowDefinitions().Size() < 3) continue;
+            BuildArcRows(st, paging);
+        }
         AdoptActiveTab(st);
         if (auto u = st.url.get().try_as<mux::FrameworkElement>()) st.hover = PointerInside(u);  // events can miss a leave
         UpdateArcTrailing(st, !st.swapped);
