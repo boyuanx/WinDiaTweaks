@@ -1104,6 +1104,42 @@ static DWORD WINAPI Bootstrap(LPVOID) {
     return 0;
 }
 
+// TEMP (peek crash hunt): log fatal-looking exceptions with a module+offset stack.
+static std::atomic<int> g_crashLogs{0};
+static void ModOff(void* addr, char* out, size_t n) {
+    HMODULE mod = nullptr;
+    char name[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)addr, &mod) && mod) {
+        GetModuleFileNameA(mod, name, MAX_PATH);
+        const char* base = strrchr(name, '\\');
+        snprintf(out, n, "%s+0x%llx", base ? base + 1 : name, (unsigned long long)((char*)addr - (char*)mod));
+    } else {
+        snprintf(out, n, "%p", addr);
+    }
+}
+static LONG CALLBACK CrashLogger(EXCEPTION_POINTERS* e) {
+    DWORD c = e->ExceptionRecord->ExceptionCode;
+    if (c != 0xC0000005 && c != 0xC000001D && c != 0x80000003 && c != 0xC0000094 && c != 0xC00000FD &&
+        c != 0xC0000374 && c != 0xC0000409)
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (g_crashLogs++ >= 6) return EXCEPTION_CONTINUE_SEARCH;
+    char at[300];
+    ModOff(e->ExceptionRecord->ExceptionAddress, at, sizeof(at));
+    std::string line = "EXCEPTION 0x" + [&] { char b[16]; snprintf(b, 16, "%08lx", c); return std::string(b); }() +
+                       " at " + at + " stack:";
+    void* frames[40];
+    USHORT n = RtlCaptureStackBackTrace(0, 40, frames, nullptr);
+    for (USHORT i = 0; i < n; i++) {
+        char f[300];
+        ModOff(frames[i], f, sizeof(f));
+        line += " ";
+        line += f;
+    }
+    Log("%s", line.c_str());
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 BOOL APIENTRY DllMain(HMODULE m, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_DETACH && g_diag && !g_safeMode) {
         // Dia is closing normally: not a crash.
@@ -1112,6 +1148,7 @@ BOOL APIENTRY DllMain(HMODULE m, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         g_module = m;
         DisableThreadLibraryCalls(m);
+        AddVectoredExceptionHandler(1, CrashLogger);
         wchar_t path[MAX_PATH];
         GetModuleFileNameW(m, path, MAX_PATH);
         g_dir = path;
