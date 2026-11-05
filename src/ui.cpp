@@ -324,6 +324,7 @@ struct NavHook {
     winrt::weak_ref<muxc::NavigationView> nav;
     muxc::NavigationViewItem item{nullptr};
     mux::FrameworkElement page{nullptr};
+    muxc::Border updatesHost{nullptr};
     wf::IInspectable saved{nullptr};
     InstanceHandle handle = 0;
 };
@@ -820,8 +821,6 @@ static std::wstring PlainNotes(const std::wstring& md) {
     return out;
 }
 
-static thread_local winrt::weak_ref<muxc::Border> t_updHost;
-static thread_local int t_updShown = -1;
 
 // A row with an optional button (empty label: none).
 static mux::FrameworkElement UpdateRow(const wchar_t* glyph, const std::wstring& title, const std::wstring& desc,
@@ -835,7 +834,7 @@ static mux::FrameworkElement UpdateRow(const wchar_t* glyph, const std::wstring&
 }
 
 static void FillUpdates(muxc::Border host) {
-    t_updShown = g_updGen;
+    const int generation = g_updGen;
     UpdateState u = UpdateSnapshot();
     auto get = [&](const char* k) { return u.found.count(k) ? u.found[k] : std::wstring(); };
     std::vector<mux::FrameworkElement> rows;
@@ -942,11 +941,12 @@ static void FillUpdates(muxc::Border host) {
         list.Children().Append(rows[i]);
     }
     host.Child(list);
+    host.Tag(box_value(generation));
 }
 
-static mux::FrameworkElement UpdatesSection() {
+static mux::FrameworkElement UpdatesSection(NavHook& hook) {
     muxc::Border host;
-    t_updHost = winrt::make_weak(host);
+    hook.updatesHost = host;
     {
         std::lock_guard<std::mutex> lk(g_updMx);
         g_upd.found.erase("busy");  // a fresh page: show the buttons again
@@ -961,7 +961,19 @@ static mux::FrameworkElement UpdatesSection() {
 static void SyncUpdates() {
     MaybeAutoCheck();
     int gen = g_updGen;
-    if (auto host = t_updHost.get(); host && gen != t_updShown) FillUpdates(host);
+    for (auto& h : t_navs) {
+        if (!h.updatesHost || unbox_value_or<int>(h.updatesHost.Tag(), -1) == gen) continue;
+        // Only the Patches page on screen; a hidden one is rebuilt when it's shown again.
+        auto nav = h.nav.get();
+        if (!nav || !h.page || nav.Content() != h.page) continue;
+        try {
+            FillUpdates(h.updatesHost);
+        } catch (...) {
+            // Don't retry every tick (and starve the badge below); try again on the next change.
+            Log("updates: can't redraw the Updates section");
+            h.updatesHost.Tag(box_value(gen));
+        }
+    }
     UpdateState u = UpdateSnapshot();
     int count = (u.found["dia.available"] == L"1") + (u.found["tweaks.available"] == L"1");
     for (auto& h : t_navs) {
@@ -979,7 +991,7 @@ static void SyncUpdates() {
     }
 }
 
-static mux::FrameworkElement BuildPage() {
+static mux::FrameworkElement BuildPage(NavHook& hook) {
     EnsureCardLook();
     t_toggles.clear();
 
@@ -1016,7 +1028,7 @@ static mux::FrameworkElement BuildPage() {
                        })}));
     }
 
-    stack.Children().Append(UpdatesSection());
+    stack.Children().Append(UpdatesSection(hook));
     stack.Children().Append(Section(L"Preset", {PresetRow()}));
 
     std::vector<std::wstring> order;
@@ -1082,7 +1094,7 @@ static bool IsOurs(const NavHook& h, const muxc::NavigationViewSelectionChangedE
 static void RebuildShownPages() {
     for (auto& h : t_navs)
         if (auto nav = h.nav.get(); nav && h.page && nav.Content() == h.page) {
-            h.page = BuildPage();
+            h.page = BuildPage(h);
             nav.Content(h.page);
         }
 }
@@ -1132,7 +1144,7 @@ static void HookNav(InstanceHandle navH) {
                 auto cur = sender.Content();
                 if (!h.page || cur != h.page) h.saved = cur;
                 if (auto c = cur.try_as<mux::DependencyObject>()) CaptureCardLook(c);
-                h.page = BuildPage();
+                h.page = BuildPage(h);
                 sender.Content(h.page);
             } else if (h.page && sender.Content() == h.page) {
                 sender.Content(h.saved);  // Dia switched pages inside its own content; show it again
