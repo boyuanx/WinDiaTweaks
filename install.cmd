@@ -13,10 +13,14 @@ rem Updating: Dia can't have the add-on loaded while it's rebuilt, so close Dia 
 rem the tweaks at the end). Asked politely first, so it can save its tabs.
 if exist bin\DiaTweaksTap.dll %PS% -NoProfile -Command "$d = Get-Process Dia -ErrorAction SilentlyContinue; if ($d) { Write-Host 'Closing Dia to update WinDiaTweaks...'; $d | ForEach-Object { [void]$_.CloseMainWindow() }; Start-Sleep -Seconds 3; Get-Process Dia -ErrorAction SilentlyContinue | Stop-Process -Force; Start-Sleep -Seconds 1 }"
 
+rem The helper behind "Patch Dia however it's opened" keeps bin\DiaLauncher.exe in use: stop it first.
+if exist bin\diatweaks.exe bin\diatweaks.exe stop-helper
+
 call "%~dp0build.cmd" || (echo. & echo Build failed. See "Install" in README.md for what it needs. & (if defined UPDATE pause) & exit /b 1)
 
 rem "Dia (Tweaks)" in the Start menu and on the desktop, with the icon of the Dia on this PC.
 if defined UPDATE ("%~dp0bin\diatweaks.exe" shortcuts --update) else ("%~dp0bin\diatweaks.exe" shortcuts)
+"%~dp0bin\diatweaks.exe" sync-helper >nul
 echo Added "Dia (Tweaks)" to the Start menu and the desktop.
 
 "%~dp0bin\diatweaks.exe" restart

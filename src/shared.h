@@ -9,3 +9,7 @@ static const CLSID CLSID_DiaTweaksTap = {0x7a1c3f52, 0x9b4e, 0x4d2a, {0x8f, 0x61
 // that loaded but couldn't attach to try again.
 #define DT_EVENT_ATTACHED L"Local\\DiaTweaksWin_Attached_"
 #define DT_EVENT_RETRY    L"Local\\DiaTweaksWin_Retry_"
+// The helper behind "Patch Dia however it's opened" (DiaLauncher.exe --watch): held while it runs, and
+// set to make it stop.
+#define DT_WATCH_MUTEX L"Local\\DiaTweaksWin_Watcher"
+#define DT_WATCH_STOP  L"Local\\DiaTweaksWin_WatcherStop"
