@@ -80,6 +80,24 @@ Prefer to compile it from the code here?
 
 It builds WinDiaTweaks on your PC, adds **Dia (Tweaks)** to the Start menu and reopens Dia with the tweaks. At the end it asks whether you'd like to star the repo (y/n): with the [GitHub CLI](https://cli.github.com) signed in it stars it for you, otherwise it opens the repo page. Open Dia from **Dia (Tweaks)** from now on, then go to **Settings → Patches**.
 
+### Optional: use your normal Dia launcher
+
+An opt-in sign-in helper can load patches when you open Dia normally. In PowerShell,
+from the WinDiaTweaks folder:
+
+```powershell
+.\auto-attach.ps1 -Install      # Source installation
+# For a prebuilt installation, use: .\bin\auto-attach.ps1 -Install
+```
+
+The helper starts now and at sign-in. It checks once per second, attaches to an
+existing Dia window and never opens or restarts the browser. It does not create
+another browser profile or change your existing launch shortcuts.
+
+Run the same script with `-Disable` to stop it and remove its sign-in entry. The
+entry is backed up, not deleted. Failures are recorded in `bin\auto-attach.log`.
+Uninstalling WinDiaTweaks disables the helper too. No administrator rights are needed.
+
 ## The `diatweaks` command
 
 `diatweaks.exe` is in the `bin` folder. Run it on its own to open Dia with the tweaks (or reload them if Dia already has them), or:
@@ -92,6 +110,7 @@ It builds WinDiaTweaks on your PC, adds **Dia (Tweaks)** to the Start menu and r
 | `diatweaks set windowMaterial acrylic` | Sets a tweak's option |
 | `diatweaks status` | Shows whether Dia is running with the tweaks, and which are on |
 | `diatweaks restart` | Closes Dia and opens it again with the tweaks |
+| `diatweaks attach` | Loads patches into running Dia without opening or restarting it |
 | `diatweaks check` | Shows the installed and newest versions of Dia and WinDiaTweaks |
 | `diatweaks update` | Installs updates to Dia and WinDiaTweaks (or `update dia`, `update tweaks`) |
 
@@ -137,7 +156,9 @@ Nothing in Dia's install folder is changed. `diatweaks.exe` opens Dia and loads 
 <details>
 <summary><strong>Does it run in the background?</strong></summary>
 
-No. Nothing stays running after you close Dia, and nothing starts with Windows. If you open Dia some other way than **Dia (Tweaks)** or `diatweaks`, you simply get Dia without the tweaks.
+Not by default. Nothing stays running after you close Dia, and nothing starts with Windows. If you open Dia some other way than **Dia (Tweaks)** or `diatweaks`, you simply get Dia without the tweaks.
+
+If you enable the [optional sign-in helper](#optional-use-your-normal-dia-launcher), that helper stays running and loads patches when Dia opens normally. Run its `-Disable` option to turn this off.
 
 </details>
 

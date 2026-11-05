@@ -387,6 +387,16 @@ static int CmdApply() {
     return StartTweaked(false) ? 0 : 1;
 }
 
+// Only attach to an existing UI process; normal launches must not be restarted.
+static int CmdAttach() {
+    DWORD pid = FindDiaUiPid();
+    if (!pid) return 2;
+    if (TapLoaded(pid)) return 0;
+    if (!InjectTap(pid) || !WaitForTap(10)) return 1;
+    wprintf(L"Tweaks attached to running Dia (pid %lu)\n", pid);
+    return 0;
+}
+
 static int CmdDump() {
     DWORD pid = FindDiaUiPid();
     if (!pid || !TapLoaded(pid)) {
@@ -1017,7 +1027,7 @@ static int CmdInstall(int argc, wchar_t** argv) {
     wprintf(L"Installing WinDiaTweaks %ls in %ls...\n", WDT_VERSION, to.c_str());
     SHCreateDirectoryExW(nullptr, to.c_str(), nullptr);
     CloseDia();
-    for (const wchar_t* name : {L"diatweaks.exe", L"DiaTweaksTap.dll", L"uninstall.cmd", L"LICENSE"}) {
+    for (const wchar_t* name : {L"diatweaks.exe", L"DiaTweaksTap.dll", L"auto-attach.ps1", L"uninstall.cmd", L"LICENSE"}) {
         std::wstring from = g_dir + L"\\" + name;
         if (GetFileAttributesW(from.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
         if (!Replace(from, to + L"\\" + name)) {
@@ -1061,6 +1071,7 @@ static void Usage() {
         L"WinDiaTweaks " WDT_VERSION L" (unofficial)\n\n"
         L"  diatweaks                 start Dia with tweaks (or reload if already tweaked)\n"
         L"  diatweaks restart         close Dia and start it again with tweaks\n"
+        L"  diatweaks attach          attach to running Dia without restarting it\n"
         L"  diatweaks list            show tweaks and whether they're on\n"
         L"  diatweaks enable <name>   turn a tweak on (name or 'all')\n"
         L"  diatweaks disable <name>  turn a tweak off\n"
@@ -1093,6 +1104,7 @@ int wmain(int argc, wchar_t** argv) {
     if (cmd == L"merge-conf" && argc > 3) return MergeConfFiles(argv[2], argv[3]) ? 0 : 1;
     if (cmd == L"apply" || cmd == L"launch" || cmd == L"restart") CleanUpAfterUpdate();
     if (cmd == L"apply") return CmdApply();
+    if (cmd == L"attach") return CmdAttach();
     if (cmd == L"launch" || cmd == L"restart") return StartTweaked(false) ? 0 : 1;
     if (cmd == L"list") return ListTweaks(), 0;
     if (cmd == L"status") return CmdStatus();
