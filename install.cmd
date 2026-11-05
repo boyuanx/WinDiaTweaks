@@ -16,7 +16,7 @@ if exist bin\DiaTweaksTap.dll %PS% -NoProfile -Command "$d = Get-Process Dia -Er
 call "%~dp0build.cmd" || (echo. & echo Build failed. See "Install" in README.md for what it needs. & (if defined UPDATE pause) & exit /b 1)
 
 set "LNK=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Dia (Tweaks).lnk"
-%PS% -NoProfile -Command "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:LNK); $s.TargetPath='%~dp0bin\diatweaks.exe'; $s.WorkingDirectory='%~dp0bin'; $s.Description='Open Dia with WinDiaTweaks'; $s.WindowStyle=7; $s.Save()"
+%PS% -NoProfile -Command "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:LNK); $s.TargetPath='%~dp0bin\DiaLauncher.exe'; $s.WorkingDirectory='%~dp0bin'; $s.Description='Open Dia with WinDiaTweaks'; $s.Save()"
 echo Added "Dia (Tweaks)" to the Start menu.
 
 "%~dp0bin\diatweaks.exe" restart

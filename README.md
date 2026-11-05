@@ -165,7 +165,7 @@ If you enable the [optional sign-in helper](#optional-use-your-normal-dia-launch
 <details>
 <summary><strong>My antivirus complains.</strong></summary>
 
-Loading an add-on into another app is something antivirus software watches for. It's built from this code, so you can read exactly what it does. Allow `bin\diatweaks.exe` and `bin\DiaTweaksTap.dll` if it's blocked.
+Loading an add-on into another app is something antivirus software watches for. It's built from this code, so you can read exactly what it does. Allow `bin\diatweaks.exe`, `bin\DiaLauncher.exe` and `bin\DiaTweaksTap.dll` if it's blocked.
 
 </details>
 
