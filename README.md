@@ -58,7 +58,7 @@ Install [Dia](https://www.diabrowser.com), then paste this into PowerShell:
 irm https://github.com/zioder/WinDiaTweaks/releases/latest/download/install.ps1 | iex
 ```
 
-It downloads the newest [release](https://github.com/zioder/WinDiaTweaks/releases) into `%USERPROFILE%\WinDiaTweaks\bin`, adds **Dia (Tweaks)** to the Start menu and reopens Dia with the tweaks. Open Dia from **Dia (Tweaks)** from now on, then go to **Settings → Patches**.
+It downloads the newest [release](https://github.com/zioder/WinDiaTweaks/releases) into `%USERPROFILE%\WinDiaTweaks\bin`, adds **Dia (Tweaks)** to the Start menu and the desktop and reopens Dia with the tweaks. Open Dia from **Dia (Tweaks)** from now on, then go to **Settings → Patches**.
 
 ### Build it yourself
 
@@ -78,7 +78,7 @@ Prefer to compile it from the code here?
    git clone https://github.com/zioder/WinDiaTweaks.git "$HOME\WinDiaTweaks"; & "$HOME\WinDiaTweaks\install.cmd"
    ```
 
-It builds WinDiaTweaks on your PC, adds **Dia (Tweaks)** to the Start menu and reopens Dia with the tweaks. At the end it asks whether you'd like to star the repo (y/n): with the [GitHub CLI](https://cli.github.com) signed in it stars it for you, otherwise it opens the repo page. Open Dia from **Dia (Tweaks)** from now on, then go to **Settings → Patches**.
+It builds WinDiaTweaks on your PC, adds **Dia (Tweaks)** to the Start menu and the desktop and reopens Dia with the tweaks. At the end it asks whether you'd like to star the repo (y/n): with the [GitHub CLI](https://cli.github.com) signed in it stars it for you, otherwise it opens the repo page. Open Dia from **Dia (Tweaks)** from now on, then go to **Settings → Patches**.
 
 ### Optional: use your normal Dia launcher
 
@@ -111,6 +111,7 @@ Uninstalling WinDiaTweaks disables the helper too. No administrator rights are n
 | `diatweaks status` | Shows whether Dia is running with the tweaks, and which are on |
 | `diatweaks restart` | Closes Dia and opens it again with the tweaks |
 | `diatweaks attach` | Loads patches into running Dia without opening or restarting it |
+| `diatweaks shortcuts` | Adds **Dia (Tweaks)**, with Dia's icon, to the Start menu and the desktop again |
 | `diatweaks check` | Shows the installed and newest versions of Dia and WinDiaTweaks |
 | `diatweaks update` | Installs updates to Dia and WinDiaTweaks (or `update dia`, `update tweaks`) |
 
@@ -178,7 +179,7 @@ WinDiaTweaks watches for that: after two launches in a row where Dia closes almo
 
 ## Uninstall
 
-Run `uninstall.cmd` in the WinDiaTweaks folder (`bin` for an installed release). It removes the Start menu shortcut and reopens Dia without the tweaks. Then delete the folder.
+Run `uninstall.cmd` in the WinDiaTweaks folder (`bin` for an installed release). It removes the Start menu and desktop shortcuts and reopens Dia without the tweaks. Then delete the folder.
 
 ## Credits
 

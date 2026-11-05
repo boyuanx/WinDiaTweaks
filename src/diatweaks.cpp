@@ -1079,16 +1079,89 @@ static bool MergeConfFiles(const std::wstring& fresh, const std::wstring& mine) 
     return out.good();
 }
 
-static bool CreateShortcut(const std::wstring& target) {
-    PWSTR programs = nullptr;
-    if (FAILED(SHGetKnownFolderPath(FOLDERID_Programs, 0, nullptr, &programs))) return false;
-    std::wstring lnk = std::wstring(programs) + L"\\Dia (Tweaks).lnk";
-    CoTaskMemFree(programs);
+// ---------------------------------------------------------------- shortcuts
+
+#pragma pack(push, 2)
+struct IconGroupEntry {  // one image in an RT_GROUP_ICON resource
+    BYTE width, height, colors, reserved;
+    WORD planes, bits;
+    DWORD bytes;
+    WORD id;
+};
+#pragma pack(pop)
+
+// Copies the icon of the Dia installed on this PC into an .ico file, so the shortcuts look like Dia's
+// own (and keep working when a Dia update moves its folder). Nothing of Dia's ships with WinDiaTweaks.
+static bool SaveDiaIcon(const std::wstring& ico) {
+    std::wstring exe = DiaExePath();
+    if (exe.empty()) return false;
+    HMODULE m = LoadLibraryExW(exe.c_str(), nullptr, LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+    if (!m) return false;
+    struct First {
+        LPCWSTR id = nullptr;
+        std::wstring name;
+    } first;
+    EnumResourceNamesW(
+        m, RT_GROUP_ICON,
+        [](HMODULE, LPCWSTR, LPWSTR name, LONG_PTR p) -> BOOL {
+            auto f = reinterpret_cast<First*>(p);
+            if (IS_INTRESOURCE(name)) f->id = name;
+            else f->name = name, f->id = f->name.c_str();
+            return FALSE;  // the first group is the app's icon
+        },
+        (LONG_PTR)&first);
+    bool ok = false;
+    HRSRC group = first.id ? FindResourceW(m, first.id, RT_GROUP_ICON) : nullptr;
+    auto* dir = group ? static_cast<const BYTE*>(LockResource(LoadResource(m, group))) : nullptr;
+    if (dir) {
+        WORD count = *reinterpret_cast<const WORD*>(dir + 4);
+        auto* entries = reinterpret_cast<const IconGroupEntry*>(dir + 6);
+        // .ico layout: 6-byte header, 16-byte entry per image (offset instead of resource id), then images.
+        std::string head(6, '\0'), body;
+        head[2] = 1;
+        memcpy(&head[4], &count, 2);
+        DWORD offset = 6 + 16 * count;
+        ok = count > 0;
+        for (WORD i = 0; i < count && ok; i++) {
+            HRSRC r = FindResourceW(m, MAKEINTRESOURCEW(entries[i].id), RT_ICON);
+            const void* data = r ? LockResource(LoadResource(m, r)) : nullptr;
+            if (!data) {
+                ok = false;
+                break;
+            }
+            DWORD size = SizeofResource(m, r), at = offset + (DWORD)body.size();
+            head.append(reinterpret_cast<const char*>(&entries[i]), 8);  // width .. bits
+            head.append(reinterpret_cast<const char*>(&size), 4);
+            head.append(reinterpret_cast<const char*>(&at), 4);
+            body.append(static_cast<const char*>(data), size);
+        }
+        if (ok) {
+            std::wstring tmp = ico + L".tmp";
+            std::ofstream out(tmp, std::ios::binary);
+            out << head << body;
+            out.close();
+            ok = out.good() && MoveFileExW(tmp.c_str(), ico.c_str(), MOVEFILE_REPLACE_EXISTING);
+        }
+    }
+    FreeLibrary(m);
+    return ok;
+}
+
+static std::wstring KnownFolder(REFKNOWNFOLDERID id) {
+    PWSTR p = nullptr;
+    std::wstring r;
+    if (SUCCEEDED(SHGetKnownFolderPath(id, 0, nullptr, &p))) r = p;
+    CoTaskMemFree(p);
+    return r;
+}
+
+static bool SaveShortcut(const std::wstring& lnk, const std::wstring& target, const std::wstring& icon) {
     IShellLinkW* link = nullptr;
     if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&link)))) return false;
     link->SetPath(target.c_str());
     link->SetWorkingDirectory(target.substr(0, target.find_last_of(L'\\')).c_str());
     link->SetDescription(L"Open Dia with WinDiaTweaks");
+    if (!icon.empty()) link->SetIconLocation(icon.c_str(), 0);
     IPersistFile* file = nullptr;
     bool ok = SUCCEEDED(link->QueryInterface(IID_PPV_ARGS(&file))) && SUCCEEDED(file->Save(lnk.c_str(), TRUE));
     if (file) file->Release();
@@ -1096,7 +1169,31 @@ static bool CreateShortcut(const std::wstring& target) {
     return ok;
 }
 
-// What the shortcut runs (DiaLauncher.exe, no console window): open Dia with the tweaks, like Dia's own
+// "Dia (Tweaks)" in the Start menu and on the desktop, with Dia's icon, opening DiaLauncher.exe in `dir`.
+// The desktop one is added once (or always with `force`): if you delete it, updates leave it deleted.
+static bool CreateShortcuts(const std::wstring& dir, bool force) {
+    std::wstring target = dir + L"\\DiaLauncher.exe";
+    if (GetFileAttributesW(target.c_str()) == INVALID_FILE_ATTRIBUTES) target = dir + L"\\diatweaks.exe";
+    std::wstring icon = dir + L"\\dia.ico";
+    if (!SaveDiaIcon(icon) && GetFileAttributesW(icon.c_str()) == INVALID_FILE_ATTRIBUTES) icon.clear();
+
+    std::wstring programs = KnownFolder(FOLDERID_Programs);
+    bool ok = !programs.empty() && SaveShortcut(programs + L"\\Dia (Tweaks).lnk", target, icon);
+    if (!ok) fwprintf(stderr, L"Couldn't add \"Dia (Tweaks)\" to the Start menu.\n");
+
+    std::wstring desktop = KnownFolder(FOLDERID_Desktop), lnk = desktop + L"\\Dia (Tweaks).lnk";
+    std::wstring marker = dir + L"\\desktop-shortcut.added";
+    bool has = GetFileAttributesW(lnk.c_str()) != INVALID_FILE_ATTRIBUTES;
+    bool added = GetFileAttributesW(marker.c_str()) != INVALID_FILE_ATTRIBUTES;
+    if (!desktop.empty() && (force || has || !added)) {
+        if (SaveShortcut(lnk, target, icon)) std::ofstream(marker).put('\n');
+        else fwprintf(stderr, L"Couldn't add \"Dia (Tweaks)\" to the desktop.\n"), ok = false;
+    }
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);  // show the new icon right away
+    return ok;
+}
+
+// What the shortcuts run (DiaLauncher.exe, no console window): open Dia with the tweaks, like Dia's own
 // icon would. Already open with them: Dia handles it as a click on its icon. Open without them: they're
 // added to it in place, nothing is closed. Fails (so the launcher says so) if the tweaks don't attach or
 // Dia can't be brought forward.
@@ -1178,14 +1275,12 @@ static int CmdInstall(int argc, wchar_t** argv) {
         fwprintf(stderr, L"Couldn't write %ls\\tweaks.conf.\n", to.c_str());
         return 1;
     }
-    std::wstring launcher = to + L"\\DiaLauncher.exe";
-    if (GetFileAttributesW(launcher.c_str()) == INVALID_FILE_ATTRIBUTES) launcher = to + L"\\diatweaks.exe";
-    if (!CreateShortcut(launcher)) fwprintf(stderr, L"Couldn't add \"Dia (Tweaks)\" to the Start menu.\n");
+    CreateShortcuts(to, false);
     wprintf(L"Opening Dia with WinDiaTweaks %ls...\n", WDT_VERSION);
     std::wstring exe = to + L"\\diatweaks.exe";
     DWORD code = 1;
     RunAndWait(exe, Quote(exe) + L" restart", &code);
-    if (!code) wprintf(L"Done. Open Dia from \"Dia (Tweaks)\" in the Start menu from now on.\n");
+    if (!code) wprintf(L"Done. Open Dia from \"Dia (Tweaks)\" in the Start menu or on the desktop from now on.\n");
     return (int)code;
 }
 
@@ -1219,6 +1314,7 @@ static void Usage() {
         L"  diatweaks set <name> <v>  set a tweak's option (e.g. set windowMaterial acrylic)\n"
         L"  diatweaks dump            write Dia's UI tree to tree.txt (for making tweaks)\n"
         L"  diatweaks probe <names>   describe live elements by name (for making tweaks)\n"
+        L"  diatweaks shortcuts       add \"Dia (Tweaks)\" with Dia's icon to the Start menu and desktop\n"
         L"  diatweaks check           show installed and newest versions of Dia and WinDiaTweaks\n"
         L"  diatweaks update [what]   install updates: dia, tweaks, or both (the default)\n"
         L"  diatweaks version         show this WinDiaTweaks version\n\n"
@@ -1260,6 +1356,7 @@ int wmain(int argc, wchar_t** argv) {
     if (cmd == L"attach") return CmdAttach();
     if (cmd == L"launch" || cmd == L"restart") return StartTweaked(false) ? 0 : 1;
     if (cmd == L"open") return CmdOpen();
+    if (cmd == L"shortcuts") return CreateShortcuts(g_dir, !(argc > 2 && Lower(argv[2]) == L"--update")) ? 0 : 1;
     if (cmd == L"list") return ListTweaks(), 0;
     if (cmd == L"status") return CmdStatus();
     if (cmd == L"dump") return CmdDump();
