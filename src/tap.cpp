@@ -15,12 +15,18 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
 
+#include <exdisp.h>
+#include <shldisp.h>
+#include <shlobj.h>
+
 #include "engine.h"
 #include "shared.h"
+#pragma comment(lib, "uuid.lib")
 
 // ---------------------------------------------------------------- utils
 
@@ -785,6 +791,9 @@ public:
         hr = site->QueryInterface(__uuidof(IVisualTreeService2), (void**)&g_vts);
         if (FAILED(hr)) return Log("no IVisualTreeService2 0x%08lx", hr), hr;
         Log("attached to Dia (pid %lu)", GetCurrentProcessId());
+        // Tells diatweaks the tweaks are live. Kept open (and set) for as long as Dia runs.
+        static HANDLE attached = CreateEventW(
+            nullptr, TRUE, TRUE, (DT_EVENT_ATTACHED + std::to_wstring(GetCurrentProcessId())).c_str());
         CheckSafeMode();
         CloseHandle(CreateThread(nullptr, 0, StableTimer, nullptr, 0, nullptr));
         LoadConfig();
@@ -936,14 +945,76 @@ static void SetInLines(std::vector<std::string>& lines, const std::wstring& key,
     }
 }
 
+// Starts a program as Explorer's child rather than ours (through the desktop's shell view), so it runs
+// outside Dia's package: it outlives Dia, and what it writes, like a sign-in entry, isn't kept inside
+// the package.
+static bool RunViaExplorer(const std::wstring& exe, const std::wstring& args) {
+    bool ok = false;
+    IShellWindows* windows = nullptr;
+    IDispatch *desktop = nullptr, *viewDisp = nullptr, *app = nullptr;
+    IServiceProvider* sp = nullptr;
+    IShellBrowser* browser = nullptr;
+    IShellView* view = nullptr;
+    IShellFolderViewDual* folderView = nullptr;
+    IShellDispatch2* shell = nullptr;
+    VARIANT loc, empty;
+    VariantInit(&loc);
+    VariantInit(&empty);
+    loc.vt = VT_I4;
+    loc.lVal = CSIDL_DESKTOP;
+    long hwnd = 0;
+    if (SUCCEEDED(CoCreateInstance(CLSID_ShellWindows, nullptr, CLSCTX_LOCAL_SERVER, IID_PPV_ARGS(&windows))) &&
+        windows->FindWindowSW(&loc, &empty, SWC_DESKTOP, &hwnd, SWFO_NEEDDISPATCH, &desktop) == S_OK &&
+        SUCCEEDED(desktop->QueryInterface(IID_PPV_ARGS(&sp))) &&
+        SUCCEEDED(sp->QueryService(SID_STopLevelBrowser, IID_PPV_ARGS(&browser))) &&
+        SUCCEEDED(browser->QueryActiveShellView(&view)) &&
+        SUCCEEDED(view->GetItemObject(SVGIO_BACKGROUND, IID_PPV_ARGS(&viewDisp))) &&
+        SUCCEEDED(viewDisp->QueryInterface(IID_PPV_ARGS(&folderView))) && SUCCEEDED(folderView->get_Application(&app)) &&
+        SUCCEEDED(app->QueryInterface(IID_PPV_ARGS(&shell)))) {
+        BSTR file = SysAllocString(exe.c_str());
+        VARIANT vArgs, vDir, vOp, vShow;
+        VariantInit(&vArgs);
+        VariantInit(&vDir);
+        VariantInit(&vOp);
+        VariantInit(&vShow);
+        vArgs.vt = VT_BSTR;
+        vArgs.bstrVal = SysAllocString(args.c_str());
+        vDir.vt = VT_BSTR;
+        vDir.bstrVal = SysAllocString(g_dir.c_str());
+        vShow.vt = VT_I4;
+        vShow.lVal = SW_SHOWNORMAL;
+        ok = SUCCEEDED(shell->ShellExecute(file, vArgs, vDir, vOp, vShow));
+        SysFreeString(file);
+        VariantClear(&vArgs);
+        VariantClear(&vDir);
+    }
+    for (IUnknown* p : std::initializer_list<IUnknown*>{shell, app, folderView, viewDisp, view, browser, sp, desktop, windows})
+        if (p) p->Release();
+    return ok;
+}
+
+// "Patch Dia however it's opened" switched on in Settings: start its helper (it adds itself to
+// sign-in). Switched off, the helper sees the setting change, removes its sign-in entry and stops.
+static void StartWatcher() {
+    std::thread([] {
+        CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        std::wstring exe = g_dir + L"\\DiaLauncher.exe";
+        bool ok = RunViaExplorer(exe, L"--watch");
+        Log("normal launches: helper %s", ok ? "started" : "couldn't be started through Explorer");
+        CoUninitialize();
+    }).detach();
+}
+
 void Engine_SetTweak(const std::wstring& key, bool on, const std::wstring* value) {
     auto lines = ReadConfLines();
     SetInLines(lines, key, &on, value);
     // Changing one patch by hand leaves the preset: it becomes Custom.
     static const std::wstring custom = L"custom";
-    if (key != L"preset" && key != L"checkForUpdates") SetInLines(lines, L"preset", nullptr, &custom);
+    if (key != L"preset" && key != L"checkForUpdates" && key != L"normalLaunch")
+        SetInLines(lines, L"preset", nullptr, &custom);
     WriteConfLines(lines);
     ApplyConfigNow();
+    if (key == L"normalLaunch" && on) StartWatcher();
 }
 
 void Engine_SetMany(const std::vector<std::pair<std::wstring, bool>>& states,
@@ -1059,22 +1130,26 @@ typedef HRESULT(WINAPI* PFN_InitXamlDiag)(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, CLSI
 // InitializeXamlDiagnosticsEx is live in THIS process. Call it with our own pid to have WinUI create
 // the Tap (via DllGetClassObject) and hand it IXamlDiagnostics. This is the in-process entry the API
 // is designed for; it just needs code running in Dia, which the one-time loader provides.
-static DWORD WINAPI Bootstrap(LPVOID) {
+static bool TryAttach() {
+    // diatweaks loads us the moment Dia starts, before WinUI: poll often, so we attach before Dia's
+    // window first shows and its UI comes up already tweaked.
     HMODULE udk = nullptr;
-    for (int i = 0; i < 150 && !udk; i++) {
+    ULONGLONG end = GetTickCount64() + 40000;
+    while (!udk && GetTickCount64() < end) {
         udk = GetModuleHandleW(L"Microsoft.Internal.FrameworkUdk.dll");
-        if (!udk) Sleep(100);
+        if (!udk) Sleep(10);
     }
-    if (!udk) return Log("FrameworkUdk not present in this process"), 1;
+    if (!udk) return Log("FrameworkUdk not present in this process"), false;
     auto init = (PFN_InitXamlDiag)GetProcAddress(udk, "InitializeXamlDiagnosticsEx");
-    if (!init) return Log("InitializeXamlDiagnosticsEx not found"), 1;
+    if (!init) return Log("InitializeXamlDiagnosticsEx not found"), false;
     // Wait for the WinUI framework dll to be loaded in this process.
     HMODULE xaml = nullptr;
-    for (int i = 0; i < 150 && !xaml; i++) {
+    end = GetTickCount64() + 40000;
+    while (!xaml && GetTickCount64() < end) {
         xaml = GetModuleHandleW(L"Microsoft.ui.xaml.dll");
-        if (!xaml) Sleep(100);
+        if (!xaml) Sleep(10);
     }
-    if (!xaml) return Log("Microsoft.ui.xaml.dll not present in this process"), 1;
+    if (!xaml) return Log("Microsoft.ui.xaml.dll not present in this process"), false;
 
     // arg3 (wszDllXamlDiagnostics) must point at the loaded WinUI framework dll so the diagnostics
     // code knows which XAML runtime to attach to. Passing L"" is why it returned NOT_FOUND.
@@ -1090,19 +1165,43 @@ static DWORD WINAPI Bootstrap(LPVOID) {
     // "VisualDiagConnection1" is the old UWP (Windows.UI.Xaml) name.
     const wchar_t* kDiagDlls[] = {xamlPath, L"Microsoft.ui.xaml.dll"};
 
+    // Early in Dia's start the endpoint may not answer yet: keep probing until it does.
     HRESULT hr = E_FAIL;
-    for (int n = -1; n < 8; n++) {
-        std::wstring ep = L"WinUIVisualDiagConnection";
-        if (n >= 0) ep += std::to_wstring(n);
-        for (auto dll : kDiagDlls) {
-            if (g_diag) return Log("already attached via SetSite; stopping probe"), 0;
-            hr = init(ep.c_str(), GetCurrentProcessId(), dll, tapPath, CLSID_DiaTweaksTap, L"");
-            Log("probe ep=%ls diagDll=%ls -> 0x%08lx", ep.c_str(), dll, hr);
-            if (SUCCEEDED(hr)) return Log("attached via ep=%ls", ep.c_str()), 0;
+    end = GetTickCount64() + 30000;
+    for (int round = 0; GetTickCount64() < end; round++) {
+        for (int n = -1; n < 8; n++) {
+            std::wstring ep = L"WinUIVisualDiagConnection";
+            if (n >= 0) ep += std::to_wstring(n);
+            for (auto dll : kDiagDlls) {
+                if (g_diag) return Log("already attached via SetSite; stopping probe"), true;
+                hr = init(ep.c_str(), GetCurrentProcessId(), dll, tapPath, CLSID_DiaTweaksTap, L"");
+                if (!round) Log("probe ep=%ls diagDll=%ls -> 0x%08lx", ep.c_str(), dll, hr);
+                if (SUCCEEDED(hr)) return Log("attached via ep=%ls (probe round %d)", ep.c_str(), round), true;
+            }
         }
+        Sleep(20);
     }
     Log("in-process InitializeXamlDiagnosticsEx failed everywhere, last 0x%08lx", hr);
-    return 0;
+    return false;
+}
+
+// Attaches, and if that fails, waits for diatweaks to ask for another try (it does when it finds us
+// loaded but not attached) instead of leaving Dia untweaked for good.
+static DWORD WINAPI Bootstrap(LPVOID) {
+    HANDLE retry =
+        CreateEventW(nullptr, FALSE, FALSE, (DT_EVENT_RETRY + std::to_wstring(GetCurrentProcessId())).c_str());
+    for (;;) {
+        if (TryAttach()) {
+            // WinUI accepted us; it hands over the UI (SetSite) on its own thread shortly after.
+            for (ULONGLONG end = GetTickCount64() + 5000; !g_diag && GetTickCount64() < end;) Sleep(10);
+            if (g_diag) return 0;
+            Log("diagnostics answered but never handed over Dia's UI");
+        }
+        if (!retry || g_diag) return 0;
+        Log("waiting for diatweaks to ask for another try");
+        WaitForSingleObject(retry, INFINITE);
+        if (g_diag) return 0;
+    }
 }
 
 BOOL APIENTRY DllMain(HMODULE m, DWORD reason, LPVOID) {

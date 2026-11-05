@@ -1,6 +1,6 @@
 @echo off
-rem WinDiaTweaks installer: builds the add-on on this PC, adds a "Dia (Tweaks)" shortcut to the
-rem Start menu, and opens Dia with the tweaks. Nothing in Dia's install folder is changed.
+rem WinDiaTweaks installer: builds the add-on on this PC, adds "Dia (Tweaks)" shortcuts to the
+rem Start menu and desktop, and opens Dia with the tweaks. Nothing in Dia's install folder is changed.
 rem install.cmd /update is what Settings > Patches > Updates runs after git pull: no star prompt.
 setlocal
 if /i "%~1"=="/update" set "UPDATE=1"
@@ -13,15 +13,19 @@ rem Updating: Dia can't have the add-on loaded while it's rebuilt, so close Dia 
 rem the tweaks at the end). Asked politely first, so it can save its tabs.
 if exist bin\DiaTweaksTap.dll %PS% -NoProfile -Command "$d = Get-Process Dia -ErrorAction SilentlyContinue; if ($d) { Write-Host 'Closing Dia to update WinDiaTweaks...'; $d | ForEach-Object { [void]$_.CloseMainWindow() }; Start-Sleep -Seconds 3; Get-Process Dia -ErrorAction SilentlyContinue | Stop-Process -Force; Start-Sleep -Seconds 1 }"
 
+rem The helper behind "Patch Dia however it's opened" keeps bin\DiaLauncher.exe in use: stop it first.
+if exist bin\diatweaks.exe bin\diatweaks.exe stop-helper
+
 call "%~dp0build.cmd" || (echo. & echo Build failed. See "Install" in README.md for what it needs. & (if defined UPDATE pause) & exit /b 1)
 
-set "LNK=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Dia (Tweaks).lnk"
-%PS% -NoProfile -Command "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:LNK); $s.TargetPath='%~dp0bin\diatweaks.exe'; $s.WorkingDirectory='%~dp0bin'; $s.Description='Open Dia with WinDiaTweaks'; $s.WindowStyle=7; $s.Save()"
-echo Added "Dia (Tweaks)" to the Start menu.
+rem "Dia (Tweaks)" in the Start menu and on the desktop, with the icon of the Dia on this PC.
+if defined UPDATE ("%~dp0bin\diatweaks.exe" shortcuts --update) else ("%~dp0bin\diatweaks.exe" shortcuts)
+"%~dp0bin\diatweaks.exe" sync-helper >nul
+echo Added "Dia (Tweaks)" to the Start menu and the desktop.
 
 "%~dp0bin\diatweaks.exe" restart
 echo.
-echo Done. Open Dia from "Dia (Tweaks)" from now on, then Settings ^> Patches.
+echo Done. Open Dia from "Dia (Tweaks)" in the Start menu or on the desktop from now on, then Settings ^> Patches.
 if defined UPDATE (timeout /t 3 >nul & exit /b 0)
 
 rem Optional: star the repo, only after the person presses y. Keys typed during the build are thrown

@@ -328,6 +328,7 @@ struct NavHook {
     winrt::weak_ref<muxc::NavigationView> nav;
     muxc::NavigationViewItem item{nullptr};
     mux::FrameworkElement page{nullptr};
+    muxc::Border updatesHost{nullptr};
     wf::IInspectable saved{nullptr};
     InstanceHandle handle = 0;
 };
@@ -574,7 +575,7 @@ static void ApplyPreset(const std::wstring& preset) {
                                                L"peek"};
     std::vector<std::pair<std::wstring, bool>> states;
     for (auto& t : Engine_Tweaks())
-        if (t.key != L"preset" && t.key != L"checkForUpdates" && !t.noSwitch)  // a setting, not a patch
+        if (t.key != L"preset" && t.key != L"checkForUpdates" && t.key != L"normalLaunch" && !t.noSwitch)  // settings, not patches
             states.push_back({t.key, preset == L"arc" && arc.count(t.key) > 0});
     if (preset == L"arc") values.push_back({L"windowMaterial", L"acrylic"});
     Engine_SetMany(states, values);
@@ -824,8 +825,6 @@ static std::wstring PlainNotes(const std::wstring& md) {
     return out;
 }
 
-static thread_local winrt::weak_ref<muxc::Border> t_updHost;
-static thread_local int t_updShown = -1;
 
 // A row with an optional button (empty label: none).
 static mux::FrameworkElement UpdateRow(const wchar_t* glyph, const std::wstring& title, const std::wstring& desc,
@@ -839,7 +838,7 @@ static mux::FrameworkElement UpdateRow(const wchar_t* glyph, const std::wstring&
 }
 
 static void FillUpdates(muxc::Border host) {
-    t_updShown = g_updGen;
+    const int generation = g_updGen;
     UpdateState u = UpdateSnapshot();
     auto get = [&](const char* k) { return u.found.count(k) ? u.found[k] : std::wstring(); };
     std::vector<mux::FrameworkElement> rows;
@@ -941,11 +940,12 @@ static void FillUpdates(muxc::Border host) {
         list.Children().Append(rows[i]);
     }
     host.Child(list);
+    host.Tag(box_value(generation));
 }
 
-static mux::FrameworkElement UpdatesSection() {
+static mux::FrameworkElement UpdatesSection(NavHook& hook) {
     muxc::Border host;
-    t_updHost = winrt::make_weak(host);
+    hook.updatesHost = host;
     {
         std::lock_guard<std::mutex> lk(g_updMx);
         g_upd.found.erase("busy");  // a fresh page: show the buttons again
@@ -960,7 +960,19 @@ static mux::FrameworkElement UpdatesSection() {
 static void SyncUpdates() {
     MaybeAutoCheck();
     int gen = g_updGen;
-    if (auto host = t_updHost.get(); host && gen != t_updShown) FillUpdates(host);
+    for (auto& h : t_navs) {
+        if (!h.updatesHost || unbox_value_or<int>(h.updatesHost.Tag(), -1) == gen) continue;
+        // Only the Patches page on screen; a hidden one is rebuilt when it's shown again.
+        auto nav = h.nav.get();
+        if (!nav || !h.page || nav.Content() != h.page) continue;
+        try {
+            FillUpdates(h.updatesHost);
+        } catch (...) {
+            // Don't retry every tick (and starve the badge below); try again on the next change.
+            Log("updates: can't redraw the Updates section");
+            h.updatesHost.Tag(box_value(gen));
+        }
+    }
     UpdateState u = UpdateSnapshot();
     int count = (u.found["dia.available"] == L"1") + (u.found["tweaks.available"] == L"1");
     for (auto& h : t_navs) {
@@ -978,7 +990,7 @@ static void SyncUpdates() {
     }
 }
 
-static mux::FrameworkElement BuildPage() {
+static mux::FrameworkElement BuildPage(NavHook& hook) {
     EnsureCardLook();
     t_toggles.clear();
 
@@ -1015,7 +1027,7 @@ static mux::FrameworkElement BuildPage() {
                        })}));
     }
 
-    stack.Children().Append(UpdatesSection());
+    stack.Children().Append(UpdatesSection(hook));
     stack.Children().Append(Section(L"Preset", {PresetRow()}));
 
     std::vector<std::wstring> order;
@@ -1079,7 +1091,7 @@ static bool IsOurs(const NavHook& h, const muxc::NavigationViewSelectionChangedE
 static void RebuildShownPages() {
     for (auto& h : t_navs)
         if (auto nav = h.nav.get(); nav && h.page && nav.Content() == h.page) {
-            h.page = BuildPage();
+            h.page = BuildPage(h);
             nav.Content(h.page);
         }
 }
@@ -1129,7 +1141,7 @@ static void HookNav(InstanceHandle navH) {
                 auto cur = sender.Content();
                 if (!h.page || cur != h.page) h.saved = cur;
                 if (auto c = cur.try_as<mux::DependencyObject>()) CaptureCardLook(c);
-                h.page = BuildPage();
+                h.page = BuildPage(h);
                 sender.Content(h.page);
             } else if (h.page && sender.Content() == h.page) {
                 sender.Content(h.saved);  // Dia switched pages inside its own content; show it again
@@ -2179,19 +2191,22 @@ static void ArcOff(ArcState& st) {
 // Is the mouse pointer over this element right now (and over its window, not something on top)?
 static bool PointerInside(const mux::FrameworkElement& el) {
     POINT pt;
-    if (!el || !el.XamlRoot() || !GetCursorPos(&pt)) return false;
+    if (!el) return false;
+    auto xamlRoot = el.XamlRoot();
+    if (!xamlRoot || !GetCursorPos(&pt)) return false;
     HWND under = WindowFromPoint(pt);
     HWND root = under ? GetAncestor(under, GA_ROOT) : nullptr;
     DWORD pid = 0;
     if (!root || (GetWindowThreadProcessId(root, &pid), pid) != GetCurrentProcessId()) return false;
     try {
-        // (No island yet: calling through null would be an access violation, which catch (...) doesn't stop.)
-        if (auto env = el.XamlRoot().ContentIslandEnvironment(); env && (HWND)(uintptr_t)env.AppWindowId().Value != root)
-            return false;
+        auto environment = xamlRoot.ContentIslandEnvironment();
+        if (!environment) return false;
+        auto id = environment.AppWindowId();
+        if ((HWND)(uintptr_t)id.Value != root) return false;
     } catch (...) {
     }
     ScreenToClient(root, &pt);
-    double scale = el.XamlRoot().RasterizationScale();
+    double scale = xamlRoot.RasterizationScale();
     double x = pt.x / scale, y = pt.y / scale;
     auto o = el.TransformToVisual(nullptr).TransformPoint({0, 0});
     return x >= o.X && y >= o.Y && x < o.X + el.ActualWidth() && y < o.Y + el.ActualHeight();
@@ -3240,16 +3255,32 @@ static void RestoreButtonRegions(CaptionState& c) {
 
 // Find the window-button grid for every browser window and remember it.
 static void FindCaptions() {
+    for (auto it = t_caption.begin(); it != t_caption.end();) {
+        auto grid = it->second.grid.get();
+        if (grid && grid.XamlRoot()) {
+            ++it;
+            continue;
+        }
+        if (it->second.src) {
+            try {
+                it->second.src.RegionsChanged(it->second.token);
+            } catch (...) {
+            }
+        }
+        it = t_caption.erase(it);
+    }
     for (auto h : FindNodes(L"MinimizeButton")) {
         InstanceHandle grid = Engine_Parent(h);
         if (Engine_Name(grid) != L"RootGrid" || t_caption.count(grid)) continue;
         auto fe = Obj<mux::FrameworkElement>(grid);
-        if (!fe || !fe.XamlRoot()) continue;
+        if (!fe) continue;
+        auto root = fe.XamlRoot();
+        if (!root) continue;
         CaptionState c;
         c.grid = winrt::make_weak(fe);
         try {
-            if (auto env = fe.XamlRoot().ContentIslandEnvironment())
-                c.src = mui::InputNonClientPointerSource::GetForWindowId(env.AppWindowId());
+            auto environment = root.ContentIslandEnvironment();
+            if (environment) c.src = mui::InputNonClientPointerSource::GetForWindowId(environment.AppWindowId());
         } catch (...) {
         }
         Log("window buttons: found grid, region source %s", c.src ? "ok" : "missing");
@@ -3266,8 +3297,6 @@ static void FindCaptions() {
             });
         }
     }
-    for (auto it = t_caption.begin(); it != t_caption.end();)
-        it = it->second.grid.get() ? std::next(it) : t_caption.erase(it);
 }
 
 // Show or hide one window's buttons; `animate` fades them along with the toolbar slide.
@@ -3302,12 +3331,14 @@ static void SetCaptionHidden(CaptionState& c, bool hide, bool animate) {
 // screen the window has square corners, so Close does too.
 static bool WindowFillsScreen(const mux::FrameworkElement& el) {
     try {
-        // A window being made or closed may have no XamlRoot or island: calling through null would be an
-        // access violation, which catch (...) doesn't stop (this crashed Dia on Shift+click).
+        // An element can outlive its window and lose its XAML root during teardown.
+        if (!el) return false;
         auto root = el.XamlRoot();
-        auto env = root ? root.ContentIslandEnvironment() : nullptr;
-        if (!env) return false;
-        HWND top = GetAncestor((HWND)(uintptr_t)env.AppWindowId().Value, GA_ROOT);
+        if (!root) return false;
+        auto environment = root.ContentIslandEnvironment();
+        if (!environment) return false;
+        auto id = environment.AppWindowId();
+        HWND top = GetAncestor((HWND)(uintptr_t)id.Value, GA_ROOT);
         if (!top) return false;
         if (IsZoomed(top)) return true;
         MONITORINFO mi{sizeof(mi)};
@@ -3369,9 +3400,11 @@ static void UpdateCaptionButtons(const std::function<bool(const mux::FrameworkEl
     for (auto& [h, c] : t_caption) {
         auto fe = c.grid.get();
         if (!fe) continue;
+        auto root = fe.XamlRoot();
+        if (!root) continue;
         double barH = 0;  // this window's toolbar strip
         for (auto bh : FindNodes(L"NavigationBarHost"))
-            if (auto bar = Obj<mux::FrameworkElement>(bh); bar && bar.XamlRoot() == fe.XamlRoot() && bar.ActualHeight() > 1) {
+            if (auto bar = Obj<mux::FrameworkElement>(bh); bar && bar.XamlRoot() == root && bar.ActualHeight() > 1) {
                 barH = bar.ActualHeight();
                 break;
             }
@@ -3688,7 +3721,7 @@ static void UpdateCaptionTrim() {
         auto grid = c.grid.get();
         if (!grid || !c.src) continue;
         auto root = grid.XamlRoot();
-        if (!root) continue;  // (a window being made or closed)
+        if (!root) continue;
         bool hiddenBar = false;
         double left = 0;
         for (auto& [bh, a] : t_bars) {
