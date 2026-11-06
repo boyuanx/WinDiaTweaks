@@ -14,6 +14,7 @@ struct TweakInfo {
     std::wstring key, title, desc, section, icon, value;
     std::vector<std::pair<std::wstring, std::wstring>> choices;  // value -> label
     bool enabled = false;
+    bool noSwitch = false;  // "switch: none": its drop-down only (an option of another tweak)
 };
 
 // ---- provided by tap.cpp
@@ -55,3 +56,28 @@ void Ui_StateApplied();
 void Ui_WatchProperty(InstanceHandle h, const std::wstring& prop);
 // A named element just entered Dia's UI tree (called from the tree-change notification).
 void Ui_ElementAdded(const std::wstring& name);
+// Opens a real new tab and goes to the text there (an address or a search), as the Ctrl+T bar does.
+void Ui_OpenInNewTab(const std::wstring& text);
+
+// The address Dia shows at the bottom of a window while the pointer is over a link, or empty.
+std::wstring Ui_HoveredLink(HWND top);
+
+// Peek's preview window (or null): the toolbar-hiding tweaks leave its toolbar alone.
+void Ui_SetPeekWindow(HWND w);
+// Peek's preview window: no resizing, maximizing or minimizing (false until WinUI has its AppWindow).
+bool Ui_PeekFixedSize(HWND w);
+
+// Peek "open as tab": where a window's tab row is (screen pixels), and, with its tab menu open, Dia's
+// "Move to Window" to the window `to` (1 done, 0 menu not open yet, -1 can't).
+bool Ui_PeekTabRow(HWND win, RECT& out);
+int Ui_PeekMoveTab(HWND win, HWND to);
+// Peek's split: `win`'s tab titled `title` opened as a split beside the tab it's on (1 done, 0 not yet, -1 can't).
+int Ui_PeekSplitWith(HWND win, const std::wstring& title);
+bool Ui_PeekTabRowNamed(HWND win, const std::wstring& title, RECT& out);
+bool Ui_PeekShowTabMenu(HWND window);
+void Ui_PeekCloseTabMenu(HWND window);
+void Peek_BeforeMove();  // (peek.cpp: just before the tab moves)
+
+// ---- provided by peek.cpp (the Peek tweak: hold on a link to preview it)
+// Runs every timer tick on each UI thread.
+void Peek_Tick();
