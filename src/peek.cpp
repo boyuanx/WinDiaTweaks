@@ -3158,6 +3158,13 @@ LRESULT CALLBACK KeyHook(int code, WPARAM wp, LPARAM lp) {
                                  : vk == VK_LMENU || vk == VK_RMENU || vk == VK_MENU          ? &g_alt
                                  : vk == VK_LWIN || vk == VK_RWIN                             ? &g_win
                                                                                               : nullptr;
+        // Shift let go while Peek clicks the link for Dia (a quick Shift+click): Dia would get a plain click
+        // and open the link in your tab. Ours lets go once the click is in (InjectStep).
+        if (mod == &g_shift && !down && k->dwExtraInfo != kReplayTag && g_peek && g_peek->phase == kLoading &&
+            (g_peek->injectStep == 1 || g_peek->injectStep == 2)) {
+            g_shift = false;
+            return 1;
+        }
         if (mod && !(injected && (g_peek || k->dwExtraInfo == kReplayTag))) {  // (our own Shift isn't you)
             bool was = *mod;
             *mod = down;
