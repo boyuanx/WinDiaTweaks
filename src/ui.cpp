@@ -2246,6 +2246,15 @@ static void UpdateArcTrailing(ArcState& st, bool animate) {
 static void AttachDisplay(ArcState& st, const mux::FrameworkElement& address);
 static void UpdateArcLabel(ArcState& st) {
     auto label = st.label.get();
+    // The weak reference can stop resolving while the label is still in the pill; find it again, or the
+    // pill would keep showing whatever site it showed last.
+    if (!label)
+        if (auto bar = st.bar.get())
+            if ((label = FindByName(bar, L"diatweaksArcLabel").try_as<muxc::TextBlock>())) {
+                st.label = winrt::make_weak(label);
+                if (!st.url.get())
+                    if (auto pill = muxm::VisualTreeHelper::GetParent(label).try_as<muxc::Panel>()) st.url = winrt::make_weak(pill);
+            }
     if (!label) return;
     if (auto url = st.url.get()) AttachDisplay(st, FindByName(url, L"AssistantBarHost"));
     auto reb = st.display.get().try_as<muxc::RichEditBox>();
@@ -2706,7 +2715,114 @@ static void UnplaceCommandBar(const mux::FrameworkElement& layout, const mux::Fr
     layout.MaxWidth(std::numeric_limits<double>::infinity());
 }
 
+// With the sidebar floating, Dia shows it in a windowed popup (its own window over Dia's), which nothing
+// in Dia's window can be drawn above. While the command bar is open over it, the bar's card is lent to a
+// popup of ours, opened after the sidebar's so it sits on top; it goes back when the bar closes.
+struct LiftedBar {
+    winrt::weak_ref<mux::FrameworkElement> layout;
+    winrt::weak_ref<muxc::Panel> from;  // Dia's placement canvas
+    uint32_t index = 0;
+    muxc::Primitives::Popup popup{nullptr};
+};
+static thread_local LiftedBar t_lift;
+
+static bool SidebarInPopup(const mux::XamlRoot& root) {
+    try {
+        for (auto const& p : muxm::VisualTreeHelper::GetOpenPopupsForXamlRoot(root)) {
+            if (p == t_lift.popup) continue;
+            if (auto ch = p.Child(); ch && FindVisual(ch, [](const mux::DependencyObject& d) {
+                    auto fe = d.try_as<mux::FrameworkElement>();
+                    return fe && fe.Name() == L"SidebarBorder";
+                }))
+                return true;
+        }
+    } catch (...) {
+    }
+    return false;
+}
+
+static void UnliftCommandBar() {
+    if (!t_lift.popup) return;
+    auto popup = t_lift.popup;
+    auto layout = t_lift.layout.get();
+    auto from = t_lift.from.get();
+    uint32_t index = t_lift.index;
+    t_lift = {};
+    popup.Child(nullptr);
+    popup.IsOpen(false);
+    if (layout) {
+        layout.ClearValue(mux::FrameworkElement::WidthProperty());
+        layout.ClearValue(mux::FrameworkElement::MinHeightProperty());
+        if (from && from.IsLoaded()) {
+            from.Children().InsertAt((std::min)(index, from.Children().Size()), layout);
+            return Log("arc: command bar back in Dia's popover layer");
+        }
+    }
+    Log("arc: command bar closed over the floating sidebar");
+}
+
+static void PlaceCommandBar(const mux::FrameworkElement& layout);
+static void LiftCommandBar(const mux::FrameworkElement& layout, double x, double y) {
+    if (t_lift.popup && t_lift.layout.get() != layout) UnliftCommandBar();
+    // Dia sizes the card from its own placement canvas, which doesn't run out here (it keeps the size the
+    // card had when it opened): same width as over the docked sidebar, and as tall as its content.
+    if (layout.Width() != kCommandBarWidth) layout.Width(kCommandBarWidth);
+    auto content = FindByName(layout, L"CommandBarContainerRoot");
+    if (content && content.ActualHeight() > 0 && std::abs(layout.MinHeight() - content.ActualHeight()) > 0.5)
+        layout.MinHeight(content.ActualHeight());  // (wins over the Height Dia keeps setting)
+    if (!t_lift.popup) {
+        auto from = muxm::VisualTreeHelper::GetParent(layout).try_as<muxc::Panel>();
+        uint32_t i;
+        if (!from || !from.Children().IndexOf(layout, i)) return;
+        auto root = layout.XamlRoot();
+        from.Children().RemoveAt(i);
+        muxc::Primitives::Popup popup;
+        popup.XamlRoot(root);
+        popup.ShouldConstrainToRootBounds(false);
+        popup.Child(layout);
+        t_lift.layout = winrt::make_weak(layout);
+        t_lift.from = winrt::make_weak(from);
+        t_lift.index = i;
+        t_lift.popup = popup;
+        popup.HorizontalOffset(x);
+        popup.VerticalOffset(y);
+        popup.IsOpen(true);
+        // Taking the card out of the window dropped keyboard focus: give it back to the bar's box.
+        if (auto box = FindVisual(layout, [](const mux::DependencyObject& d) {
+                auto fe = d.try_as<mux::FrameworkElement>();
+                return fe && fe.Name() == L"QueryTextBox";
+            }).try_as<muxc::Control>())
+            box.Focus(mux::FocusState::Programmatic);
+        // Dia removes its popover when the bar closes: hand the card back then.
+        from.Unloaded([](wf::IInspectable const& sender, auto&&) {
+            if (t_lift.popup && t_lift.from.get() == sender.try_as<muxc::Panel>()) UnliftCommandBar();
+        });
+        // Suggestions appear as you type: keep the card as tall as its content.
+        if (content)
+            content.SizeChanged([weak = winrt::make_weak(layout)](auto&&, auto&&) {
+                if (auto l = weak.get(); l && t_lift.popup && t_lift.layout.get() == l) PlaceCommandBar(l);
+            });
+        Log("arc: command bar lifted above the floating sidebar");
+        return;
+    }
+    if (std::abs(t_lift.popup.HorizontalOffset() - x) > 0.5) t_lift.popup.HorizontalOffset(x);
+    if (std::abs(t_lift.popup.VerticalOffset() - y) > 0.5) t_lift.popup.VerticalOffset(y);
+}
+
+// Every pass: let go of the card once Dia removed its popover, or give it back if the sidebar docked.
+static void CheckLiftedBar() {
+    if (!t_lift.popup) return;
+    auto layout = t_lift.layout.get();
+    auto from = t_lift.from.get();
+    if (!layout || !from || !from.IsLoaded() || !Engine_TweakOn(L"arcUrlBar")) return UnliftCommandBar();
+    // Open, but the sidebar is no longer floating: back to Dia's layer, placed for the docked sidebar.
+    if (layout.Visibility() == mux::Visibility::Visible && !SidebarInPopup(layout.XamlRoot())) UnliftCommandBar();
+}
+
 static void PlaceCommandBar(const mux::FrameworkElement& layout) {
+    bool lifted = t_lift.popup && t_lift.layout.get() == layout;
+    // Closing: leave a lifted card where it is (collapsed, so not shown). Moving it mid-close cuts Dia's
+    // closing short, and Dia then never starts the page's loading animation in the pill.
     if (layout.Visibility() != mux::Visibility::Visible) return;
     auto bar = FindVisual(layout, [](const mux::DependencyObject& d) {
         auto fe = d.try_as<mux::FrameworkElement>();
@@ -2715,13 +2831,32 @@ static void PlaceCommandBar(const mux::FrameworkElement& layout) {
     if (!bar) return;  // some other popover (site menu, ...): leave it alone
     bool floating = InNewTabMode();  // the Ctrl+T bar (Floating new tab bar patch)
     bool arc = Engine_TweakOn(L"arcUrlBar");
-    if (!floating && !arc) return UnplaceCommandBar(layout, bar);
+    if (!floating && !arc) {
+        if (lifted) UnliftCommandBar();
+        return UnplaceCommandBar(layout, bar);
+    }
     auto pill = ArcPill(layout.XamlRoot());
+    // Arc mode with the sidebar floating out over the page: anchored over the pill, above the sidebar.
+    bool overFloating = !floating && pill && SidebarInPopup(layout.XamlRoot());
+    if (overFloating) {
+        double width = kCommandBarWidth;
+        for (mux::DependencyObject d = bar; d && d != layout; d = muxm::VisualTreeHelper::GetParent(d))
+            if (auto fe = d.try_as<mux::FrameworkElement>()) {
+                if (fe.MaxWidth() != width) fe.MaxWidth(width);
+                if (!std::isnan(fe.Width()) && fe.Width() > width) fe.Width(width);
+            }
+        if (layout.MaxWidth() != width) layout.MaxWidth(width);
+        layout.HorizontalAlignment(mux::HorizontalAlignment::Left);
+        auto at = pill.TransformToVisual(nullptr).TransformPoint({0, 0});
+        LiftCommandBar(layout, at.X - 4, at.Y - 6);
+        return;
+    }
+    if (lifted) UnliftCommandBar();
     auto canvas = muxm::VisualTreeHelper::GetParent(layout).try_as<mux::UIElement>();
     if (!canvas || (!floating && !pill)) return;
     RaisePopoverLayer(layout);
-    // Ctrl+T bar, or Arc mode with the sidebar closed (or only floating out on hover): a large bar centered
-    // over the page, like Dia's New Tab box. Arc mode with the sidebar docked: anchored over the pill.
+    // Ctrl+T bar, or Arc mode with the sidebar closed: a large bar centered over the page, like Dia's New
+    // Tab box. Arc mode with the sidebar docked: anchored over the pill.
     bool docked = !floating && SidebarDocked(layout.XamlRoot());
     auto cfe = canvas.as<mux::FrameworkElement>();
     double width, left, top;
@@ -2778,6 +2913,7 @@ static void HookCommandBarPopovers() {
 }
 
 static void ResetCommandBars() {
+    UnliftCommandBar();
     for (auto& [w, orig] : t_raised)
         if (auto l = w.get()) muxc::Canvas::SetZIndex(l, orig);
     t_raised.clear();
@@ -2836,6 +2972,7 @@ static void UpdateArcBar() {
         return;
     }
     HookCommandBarPopovers();
+    CheckLiftedBar();
     for (auto h : FindNodes(L"SpacePagingRoot")) {
         auto paging = Obj<muxc::Grid>(h);
         if (!paging) continue;
