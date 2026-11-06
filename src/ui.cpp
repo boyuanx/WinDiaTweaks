@@ -24,14 +24,18 @@
 #include <winrt/Microsoft.UI.Xaml.Input.h>
 #include <winrt/Microsoft.UI.Input.h>
 #include <winrt/Microsoft.UI.Content.h>
+#include <winrt/Microsoft.UI.Windowing.h>
 #include <winrt/Windows.Graphics.h>
 #include <cmath>
 #include <climits>
 #include <limits>
 #include <winrt/Microsoft.UI.Xaml.Automation.h>
+#include <winrt/Microsoft.UI.Xaml.Automation.Peers.h>
+#include <winrt/Microsoft.UI.Xaml.Automation.Provider.h>
 #include <winrt/Microsoft.UI.Xaml.Data.h>
 #include <winrt/Microsoft.UI.Xaml.Media.h>
 #include <winrt/Microsoft.UI.Xaml.Shapes.h>
+#include <winrt/Microsoft.UI.Xaml.Documents.h>
 
 #include <atomic>
 #include <fstream>
@@ -448,13 +452,14 @@ static mux::FrameworkElement Row(const TweakInfo& t) {
             i++;
         }
         box.SelectedIndex(sel);
-        box.SelectionChanged([key, choiceSwitch](wf::IInspectable const& s, auto&&) {
+        bool keepOn = t.noSwitch;  // (an option of another tweak: always on)
+        box.SelectionChanged([key, choiceSwitch, keepOn](wf::IInspectable const& s, auto&&) {
             if (t_syncing) return;
             auto ci = s.as<muxc::ComboBox>().SelectedItem().try_as<muxc::ComboBoxItem>();
             if (!ci) return;
             std::wstring v(unbox_value_or<winrt::hstring>(ci.Tag(), L""));
             if (choiceSwitch && v == L"off") Engine_SetTweak(key, false, nullptr);
-            else Engine_SetTweak(key, choiceSwitch || Engine_TweakOn(key), &v);
+            else Engine_SetTweak(key, choiceSwitch || keepOn || Engine_TweakOn(key), &v);
         });
         if (choiceSwitch) {
             box.IsEnabled(!Engine_SafeMode());
@@ -477,7 +482,7 @@ static mux::FrameworkElement Row(const TweakInfo& t) {
         controls.Children().Append(box);
     }
 
-    if (choiceSwitch) {
+    if (choiceSwitch || t.noSwitch) {
         muxc::Grid::SetColumn(controls, 2);
         row.Children().Append(controls);
         return row;
@@ -563,13 +568,14 @@ static void ApplyPreset(const std::wstring& preset) {
     std::vector<std::pair<std::wstring, std::wstring>> values{{L"preset", preset}};
     if (preset == L"custom") return Engine_SetMany({}, values);  // keep the patches as they are
     // Arc: the page fills the window with straight edges, the toolbar lives in the sidebar, Ctrl+T
-    // floats, no tab hover cards, an acrylic window.
+    // floats, no tab hover cards, an acrylic window, and Peek.
     static const std::set<std::wstring> arc = {L"edgeToEdge",     L"squareCorners",       L"hideToolbar",
                                                L"arcUrlBar",      L"floatingNewTab",      L"hideTabSearchButton",
-                                               L"hideChatButton", L"hideTabHoverCard",    L"windowMaterial"};
+                                               L"hideChatButton", L"hideTabHoverCard",    L"windowMaterial",
+                                               L"peek"};
     std::vector<std::pair<std::wstring, bool>> states;
     for (auto& t : Engine_Tweaks())
-        if (t.key != L"preset" && t.key != L"checkForUpdates" && t.key != L"normalLaunch")  // settings, not patches
+        if (t.key != L"preset" && t.key != L"checkForUpdates" && t.key != L"normalLaunch" && !t.noSwitch)  // settings, not patches
             states.push_back({t.key, preset == L"arc" && arc.count(t.key) > 0});
     if (preset == L"arc") values.push_back({L"windowMaterial", L"acrylic"});
     Engine_SetMany(states, values);
@@ -585,9 +591,7 @@ static int PresetIndex() {
 static mux::FrameworkElement PresetRow() {
     TweakInfo info;
     info.title = L"Preset";
-    info.desc = L"None: Dia as it comes. Arc: address bar and buttons in the sidebar, no toolbar (it slides in "
-                L"at the top edge), edge-to-edge pages with square corners, floating Ctrl+T bar, no tab hover "
-                L"cards, acrylic window. Custom: your own mix; changing any patch below switches to it.";
+    info.desc = L"A ready-made set of patches.";
     info.icon = L"E771";
     auto row = Row(info).as<muxc::Grid>();
     t_toggles.pop_back();  // Row() made a switch; a drop-down instead
@@ -854,7 +858,7 @@ static void FillUpdates(muxc::Border host) {
     bool diaNew = get("dia.available") == L"1", tweaksNew = get("tweaks.available") == L"1";
     if (diaNew && tweaksNew)
         rows.push_back(UpdateRow(L"\uE896", L"Dia and WinDiaTweaks both have updates",
-                                 L"Dia closes, both install, and it opens again with your patches.",
+                                 L"Dia restarts to install them.",
                                  busy ? L"Updating..." : L"Update both", starting(L"update"), true));
 
     // Dia
@@ -864,8 +868,7 @@ static void FillUpdates(muxc::Border host) {
     else if (noAnswer) diaDesc = L"Couldn't check: diatweaks.exe didn't answer. See tap.log.";
     else if (get("dia.installed").empty()) diaDesc = L"Couldn't find Dia's version: " + get("dia.error") + L".";
     else if (diaNew) {
-        diaDesc = L"Dia " + get("dia.latest") + L" is available. You have " + get("dia.installed") +
-                  L". Dia closes while it installs, then opens again with your patches.";
+        diaDesc = L"Dia " + get("dia.latest") + L" is available.";
         diaButton = busy ? L"Updating..." : L"Update Dia";
         diaClick = starting(L"update dia");
     } else if (get("dia.latest").empty())
@@ -875,18 +878,14 @@ static void FillUpdates(muxc::Border host) {
 
     // WinDiaTweaks
     std::wstring have = get("tweaks.installed"), latest = get("tweaks.latest"), url = get("tweaks.url");
-    bool git = get("tweaks.source") == L"git";
     std::wstring twDesc, twButton = L"Release notes";
     std::function<void()> twClick = [url] { OpenUrl(url.empty() ? L"https://github.com/zioder/WinDiaTweaks/releases" : url); };
     if (!u.checked) twDesc = u.checking ? L"Checking for updates..." : L"Not checked yet.";
     else if (noAnswer) twDesc = L"Couldn't check.";
     else if (!get("tweaks.dev").empty())
-        twDesc = L"Development build " + have + L" (" + get("tweaks.dev") + L"), so it isn't updated from here." +
-                 (latest.empty() ? L"" : L" The newest release is " + latest + L".");
+        twDesc = L"Development build " + have + L" (" + get("tweaks.dev") + L").";
     else if (tweaksNew) {
-        twDesc = L"WinDiaTweaks " + latest + L" is available. You have " + have + L"." +
-                 (git ? L" It updates this clone with git pull and rebuilds it." : L"") +
-                 L" Dia closes while it installs, then opens again with your patches.";
+        twDesc = L"WinDiaTweaks " + latest + L" is available.";
         twButton = busy ? L"Updating..." : L"Update";
         twClick = starting(L"update tweaks");
     } else if (latest.empty())
@@ -1022,8 +1021,8 @@ static mux::FrameworkElement BuildPage(NavHook& hook) {
     if (Engine_SafeMode()) {
         stack.Children().Append(Section(
             L"Safe mode",
-            {ButtonRow(L"", L"Patches are off because Dia closed twice right after opening",
-                       L"Turn them back on once you've changed whatever caused it.", L"Turn patches back on", [] {
+            {ButtonRow(L"", L"Patches are off: Dia closed twice right after opening",
+                       L"Turn them back on when ready.", L"Turn patches back on", [] {
                            Engine_LeaveSafeMode();
                        })}));
     }
@@ -1043,12 +1042,10 @@ static mux::FrameworkElement BuildPage(NavHook& hook) {
 
     stack.Children().Append(Section(
         L"DiaTweaks",
-        {ButtonRow(L"", L"Turn off all patches", L"Dia goes back to how it looks without DiaTweaks.",
+        {ButtonRow(L"", L"Turn off all patches", L"Dia as it comes.",
                    L"Turn all off", [] { ApplyPreset(L"none"); }),
          ButtonRow(L"", L"DiaTweaks for Windows",
-                   L"Unofficial. Not affiliated with The Browser Company. Changes only how Dia looks; "
-                   L"nothing in Dia's install folder is modified. Config: " +
-                       Engine_Dir() + L"\\tweaks.conf",
+                   L"Unofficial, not affiliated with The Browser Company.",
                    L"Open folder", [] {
                        ShellExecuteW(nullptr, L"open", Engine_Dir().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
                    })}));
@@ -2033,9 +2030,9 @@ static void ScheduleHoverCards() {
 
 // ---------------------------------------------------------------- Arc URL bar
 static double NowMs();
-// Arc/Zen-style sidebar: Dia's own sidebar toggle, back/forward/reload buttons and its real address
+// Arc-style sidebar: Dia's own sidebar toggle, back/forward/reload buttons and its real address
 // field (with its suggestions, bookmark and site-menu buttons) are moved out of the top toolbar into two
-// rows under the sidebar header; the top toolbar is then hidden. Like Zen's single-toolbar mode, the
+// rows under the sidebar header; the top toolbar is then hidden. Like Arc's single-toolbar mode, the
 // real elements are moved (not copied), so everything keeps working. Turning the patch off puts each
 // element back exactly where it was.
 
@@ -3061,6 +3058,7 @@ static void StyleStartPages() {
         }
         // Same size and spot as the centered Ctrl+L command bar.
         auto root = host.XamlRoot();
+        if (!root) continue;  // (a window being made or closed: calling through null would crash)
         double winW = root.Size().Width, winH = root.Size().Height;
         double width = (std::min)(kCenteredWidth, winW - 64);
         double pageTop = page.TransformToVisual(nullptr).TransformPoint({0, 0}).Y;
@@ -3172,6 +3170,8 @@ static muxc::RichEditBox FocusedNewTabBox() {
     return nullptr;
 }
 
+static void OpenTextInNewTab(const std::wstring& text);
+
 // Enter in the Ctrl+T bar: take what's typed (with Dia's autocomplete), close the bar, open a real new
 // tab, and submit the text in that tab's box. The current tab is never touched.
 static void SubmitInNewTab() {
@@ -3184,6 +3184,11 @@ static void SubmitInNewTab() {
     t_newTabMode = false;
     SendKeys({{VK_ESCAPE, true}, {VK_ESCAPE, false}});
     if (text.empty()) return;
+    OpenTextInNewTab(text);
+}
+
+// Opens a real new tab and submits the text in its box (also used by Peek's "open as tab").
+static void OpenTextInNewTab(const std::wstring& text) {
     t_pendingQuery = text;
     t_passCtrlT = true;
     bool ctrlHeld = GetAsyncKeyState(VK_CONTROL) & 0x8000;
@@ -3255,6 +3260,13 @@ static void SubmitInNewTab() {
             if (t_hiddenPage.get() && !t_unhideToken) UnhidePageLater();  // gave up: never leave it hidden
         }
     });
+}
+
+void Ui_OpenInNewTab(const std::wstring& text) {
+    try {
+        if (!text.empty()) OpenTextInNewTab(text);
+    } catch (...) {
+    }
 }
 
 static LRESULT CALLBACK ArcMsgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
@@ -3564,7 +3576,7 @@ static void UpdateCaptionButtons(const std::function<bool(const mux::FrameworkEl
 // height, so the toolbar sits above the window. Showing/hiding animates that offset every frame.
 // While sliding, the page keeps its size (only its position changes, which Dia passes on to its
 // web-content window as a cheap move); the one resize happens at the start of a hide or the end of a
-// show. Same idea as Zen's compact mode, which slides the toolbar with transforms instead of reflowing.
+// show. It slides the toolbar with transforms instead of reflowing.
 
 struct BarAnim {
     winrt::weak_ref<mux::FrameworkElement> group, bar;
@@ -3681,11 +3693,36 @@ static bool FocusWithin(const mux::FrameworkElement& bar) {
 
 static void UpdateCaptionsForToolbar();
 
+// Peek's preview is a Dia window shown clipped to its page: its toolbar stays where Dia puts it (so the
+// page is laid out plainly under it, and the clip cuts the toolbar away).
+static HWND TopWindowFor(const mux::XamlRoot& root);
+static HWND t_peekWindow = nullptr;
+void Ui_SetPeekWindow(HWND w) { t_peekWindow = w; }
+
+// Peek's preview window can't be resized, maximized or minimized (its edges, a double-click, Win+Up...).
+// False until WinUI has made its AppWindow.
+bool Ui_PeekFixedSize(HWND w) {
+    try {
+        auto app = winrt::Microsoft::UI::Windowing::AppWindow::GetFromWindowId(
+            winrt::Microsoft::UI::WindowId{(uint64_t)(uintptr_t)w});
+        if (!app) return false;
+        auto presenter = app.Presenter().try_as<winrt::Microsoft::UI::Windowing::OverlappedPresenter>();
+        if (!presenter) return false;
+        presenter.IsResizable(false);
+        presenter.IsMaximizable(false);
+        presenter.IsMinimizable(false);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 static void UpdateHiddenToolbar() {
     bool hide = Engine_TweakOn(L"hideToolbar") || Engine_TweakOn(L"arcUrlBar");
     bool show = (Engine_TweakOn(L"hideToolbar") && Engine_Hover()) ||
                 (Engine_TweakOn(L"showToolbarWithSidebar") && Ui_State(L"sidebarOpen")) ||
                 (Engine_TweakOn(L"showToolbarOnNewTab") && Ui_State(L"newTab"));
+    bool hideAll = hide;
     for (auto gh : FindNodes(L"ContentGroup")) {
         auto& a = t_bars[gh];
         auto group = a.group.get();
@@ -3699,6 +3736,10 @@ static void UpdateHiddenToolbar() {
             });
             if (auto fe = bar.try_as<mux::FrameworkElement>()) a.bar = winrt::make_weak(fe);
         }
+        // Peek's preview window: left exactly as Dia lays it out (no hiding, no slide), so its page keeps
+        // its size while Peek places it.
+        bool peek = t_peekWindow && group.XamlRoot() && TopWindowFor(group.XamlRoot()) == t_peekWindow;
+        hide = hideAll && !peek;
         if (!hide && !a.managed) continue;
         if (!a.managed) {
             a.saved = group.Margin();
@@ -3812,6 +3853,7 @@ static void TrimSink(HWND top, bool trim, int pageLeftPx) {
 // sink, whose client size matches the root's.
 static HWND TopWindowFor(const mux::XamlRoot& root) {
     struct Ctx { double w, h; HWND best = nullptr; double bestDiff = 1e9; } ctx;
+    if (!root) return nullptr;  // (a window being made or closed: calling through null would crash)
     auto sz = root.Size();
     double scale = root.RasterizationScale();
     ctx.w = sz.Width * scale;
@@ -3973,6 +4015,7 @@ bool Ui_Tick() {
             if (!Engine_TweakOn(L"arcUrlBar")) HookCommandBarPopovers();  // (Arc mode hooks them already)
         }
         UpdateNewTabMode();
+        Peek_Tick();
         UpdateHoverCards();
         if (tick % 3 == 0) {
             UpdateWindowMaterial();
@@ -3995,3 +4038,261 @@ bool Ui_Tick() {
     }
     return changed;
 }
+
+// The address Dia shows at the bottom left of a window while the pointer is over a link: empty when the
+// pointer isn't on one. Dia sets the text as soon as the pointer reaches a link and clears it when it
+// leaves; the bubble itself only fades in a moment later, so its visibility isn't waited for.
+std::wstring Ui_HoveredLink(HWND top) {
+    try {
+        for (auto h : FindNodes(L"StatusText")) {
+            auto tb = Obj<muxc::TextBlock>(h);
+            if (!tb || !tb.XamlRoot() || TopWindowFor(tb.XamlRoot()) != top) continue;
+            std::wstring text(tb.Text());
+            if (text.empty())
+                for (auto const& in : tb.Inlines())
+                    if (auto run = in.try_as<winrt::Microsoft::UI::Xaml::Documents::Run>()) text += run.Text();
+            if (!text.empty()) return text;
+        }
+    } catch (...) {
+    }
+    return L"";
+}
+
+// ---------------------------------------------------------------- Peek: move the preview's tab
+
+static mux::FrameworkElement FirstIn(const mux::DependencyObject& root,
+                                     const std::function<bool(const mux::FrameworkElement&)>& want) {
+    std::vector<mux::DependencyObject> st{root};
+    int n = 0;
+    while (!st.empty() && n++ < 5000) {
+        auto d = st.back();
+        st.pop_back();
+        if (auto fe = d.try_as<mux::FrameworkElement>(); fe && want(fe)) return fe;
+        int c = muxm::VisualTreeHelper::GetChildrenCount(d);
+        for (int i = c - 1; i >= 0; i--) st.push_back(muxm::VisualTreeHelper::GetChild(d, i));
+    }
+    return nullptr;
+}
+
+static mux::FrameworkElement PeekTabList(HWND window) {
+    for (auto h : FindNodes(L"TabListPresenter")) {
+        auto list = Obj<mux::FrameworkElement>(h);
+        auto root = list ? list.XamlRoot() : nullptr;
+        if (!root) continue;
+        auto env = root.ContentIslandEnvironment();
+        HWND top = env ? GetAncestor((HWND)(uintptr_t)env.AppWindowId().Value, GA_ROOT) : nullptr;
+        if ((top ? top : TopWindowFor(root)) == window) return list;
+    }
+    return nullptr;
+}
+
+static mux::FrameworkElement PeekTabLabel(const mux::FrameworkElement& list, HWND window) {
+    wchar_t title[512]{};
+    GetWindowTextW(window, title, ARRAYSIZE(title));
+    auto untrimmed = [](std::wstring text) {
+        if (text.ends_with(L"…")) text.pop_back();
+        else if (text.ends_with(L"...")) text.resize(text.size() - 3);
+        return text;
+    };
+    std::wstring name = untrimmed(title);
+    if (name.empty()) return nullptr;
+    return FirstIn(list, [&](const mux::FrameworkElement& fe) {
+        auto text = fe.try_as<muxc::TextBlock>();
+        if (!text || fe.ActualWidth() <= 1 || fe.ActualHeight() <= 1) return false;
+        std::wstring label = untrimmed(std::wstring(text.Text()));
+        return !label.empty() && label != L"New Tab" &&
+               (label.starts_with(name) || name.starts_with(label));
+    });
+}
+
+bool Ui_PeekTabRow(HWND win, RECT& out) {
+    try {
+        auto list = PeekTabList(win);
+        auto label = list ? PeekTabLabel(list, win) : nullptr;
+        if (!label) return false;
+        double scale = label.XamlRoot().RasterizationScale();
+        auto o = label.TransformToVisual(nullptr).TransformPoint({0, 0});
+        POINT origin{};
+        if (!ClientToScreen(win, &origin)) return false;
+        out.left = origin.x + (LONG)std::lround(o.X * scale);
+        out.top = origin.y + (LONG)std::lround(o.Y * scale);
+        out.right = out.left + (LONG)std::lround(label.ActualWidth() * scale);
+        out.bottom = out.top + (LONG)std::lround(label.ActualHeight() * scale);
+        return !IsRectEmpty(&out);
+    } catch (...) {
+        return false;
+    }
+}
+
+bool Ui_PeekShowTabMenu(HWND window) {
+    try {
+        auto list = PeekTabList(window);
+        auto label = list ? PeekTabLabel(list, window) : nullptr;
+        for (auto element = label; element && element != list;
+             element = muxm::VisualTreeHelper::GetParent(element).try_as<mux::FrameworkElement>()) {
+            if (auto flyout = element.ContextFlyout().try_as<muxc::MenuFlyout>()) {
+                flyout.ShowAt(element);
+                return true;
+            }
+        }
+    } catch (...) {
+    }
+    return false;
+}
+
+void Ui_PeekCloseTabMenu(HWND window) {
+    try {
+        if (auto list = PeekTabList(window))
+            for (auto const& popup : muxm::VisualTreeHelper::GetOpenPopupsForXamlRoot(list.XamlRoot()))
+                popup.IsOpen(false);
+    } catch (...) {
+    }
+}
+
+// Dia's menu labels omit window IDs. Select the other window only when the menu and native
+// windows make the destination unambiguous.
+// Peek's split: in `win`'s tab list, the tab titled `title` (your tab before the Peek), its menu opened (0),
+// then its "Open as split" chosen (1): Dia shows it beside the tab you're on (the Peek's). -1: can't.
+int Ui_PeekSplitWith(HWND win, const std::wstring& title) {
+    (void)title;
+    try {
+        auto list = PeekTabList(win);
+        if (!list) return Log("peek: split: no tab list"), -1;
+        // Its menu open: choose "Open as split".
+        for (auto const& pop : muxm::VisualTreeHelper::GetOpenPopupsForXamlRoot(list.XamlRoot())) {
+            auto child = pop.Child();
+            if (!child) continue;
+            auto item = FirstIn(child, [](const mux::FrameworkElement& fe) {
+                auto mi = fe.try_as<muxc::MenuFlyoutItem>();
+                return mi && std::wstring_view(mi.Text()).starts_with(L"Open as split");
+            });
+            if (!item) continue;
+            auto mi = item.as<muxc::MenuFlyoutItem>();
+            if (!mi.IsEnabled()) return Log("peek: split: Open as split is off"), -1;
+            Log("peek: split: invoking Open as split");
+            winrt::Microsoft::UI::Xaml::Automation::Peers::MenuFlyoutItemAutomationPeer(mi).Invoke();
+            return 1;
+        }
+        return 0;  // (its menu not open yet: see Ui_PeekTabRowNamed)
+    } catch (winrt::hresult_error const& e) {
+        Log("peek: split: error 0x%08lx", (unsigned long)e.code());
+        return -1;
+    } catch (...) {
+        return -1;
+    }
+}
+
+// Where the tab titled `title` is in `win`'s tab list (screen pixels), for a right-click on it.
+bool Ui_PeekTabRowNamed(HWND win, const std::wstring& title, RECT& out) {
+    try {
+        auto list = PeekTabList(win);
+        if (!list) return false;
+        auto untrimmed = [](std::wstring text) {
+            if (text.ends_with(L"…")) text.pop_back();
+            else if (text.ends_with(L"...")) text.resize(text.size() - 3);
+            return text;
+        };
+        std::wstring name = untrimmed(title);
+        if (name.empty()) return false;
+        auto label = FirstIn(list, [&](const mux::FrameworkElement& fe) {
+            auto text = fe.try_as<muxc::TextBlock>();
+            if (!text || fe.ActualWidth() <= 1 || fe.ActualHeight() <= 1) return false;
+            std::wstring l = untrimmed(std::wstring(text.Text()));
+            return !l.empty() && l != L"New Tab" && (l.starts_with(name) || name.starts_with(l));
+        });
+        if (!label) return false;
+        double scale = label.XamlRoot().RasterizationScale();
+        auto o = label.TransformToVisual(nullptr).TransformPoint({0, 0});
+        POINT origin{};
+        if (!ClientToScreen(win, &origin)) return false;
+        out.left = origin.x + (LONG)std::lround(o.X * scale);
+        out.top = origin.y + (LONG)std::lround(o.Y * scale);
+        out.right = out.left + (LONG)std::lround(label.ActualWidth() * scale);
+        out.bottom = out.top + (LONG)std::lround(label.ActualHeight() * scale);
+        return !IsRectEmpty(&out);
+    } catch (...) {
+        return false;
+    }
+}
+
+int Ui_PeekMoveTab(HWND win, HWND to) {
+    try {
+        auto list = PeekTabList(win);
+        if (!list || !IsWindow(to)) return Log("peek: no tab list (%d)", list ? 1 : 0), -1;
+        auto pops = muxm::VisualTreeHelper::GetOpenPopupsForXamlRoot(list.XamlRoot());
+        for (auto const& pop : pops) {
+            auto child = pop.Child();
+            if (!child) continue;
+            auto element = FirstIn(child, [](const mux::FrameworkElement& fe) {
+                auto sub = fe.try_as<muxc::MenuFlyoutSubItem>();
+                return sub && std::wstring_view(sub.Text()).starts_with(L"Move to Window");
+            });
+            if (!element) continue;
+            auto sub = element.as<muxc::MenuFlyoutSubItem>();
+            namespace ap = winrt::Microsoft::UI::Xaml::Automation;
+            auto peer = ap::Peers::FrameworkElementAutomationPeer::CreatePeerForElement(sub);
+            auto pattern = peer ? peer.GetPattern(ap::Peers::PatternInterface::ExpandCollapse) : nullptr;
+            auto provider = pattern.try_as<ap::Provider::IExpandCollapseProvider>();
+            if (!provider) return Log("peek: Move to Window can't expand"), -1;
+            if (provider.ExpandCollapseState() != ap::ExpandCollapseState::Expanded) {
+                provider.Expand();
+                return 0;
+            }
+
+            struct { HWND from, to; bool other = false; } windows{win, to};
+            EnumWindows([](HWND h, LPARAM param) -> BOOL {
+                auto& ctx = *reinterpret_cast<decltype(windows)*>(param);
+                if (h == ctx.from || h == ctx.to || !IsWindowVisible(h)) return TRUE;
+                DWORD pid = 0;
+                GetWindowThreadProcessId(h, &pid);
+                wchar_t cls[64]{};
+                if (pid == GetCurrentProcessId() && GetClassNameW(h, cls, ARRAYSIZE(cls)) &&
+                    wcscmp(cls, L"WinUIDesktopWin32WindowClass") == 0 && FindSink(h)) {
+                    ctx.other = true;
+                    return FALSE;
+                }
+                return TRUE;
+            }, reinterpret_cast<LPARAM>(&windows));
+            if (windows.other) {
+                Log("peek: multiple possible destination windows");
+                return -1;
+            }
+
+            std::vector<muxc::MenuFlyoutItem> destinations;
+            for (auto const& item : sub.Items()) {
+                auto candidate = item.try_as<muxc::MenuFlyoutItem>();
+                if (candidate && candidate.Text() != L"New Window") destinations.push_back(candidate);
+            }
+            for (auto const& d : destinations)
+                Log("peek: Move to Window item '%ls'%s", d.Text().c_str(), d.IsEnabled() ? "" : " (disabled)");
+            if (destinations.size() == 2 && destinations[0].IsEnabled() != destinations[1].IsEnabled()) {
+                destinations.erase(destinations.begin() + (destinations[0].IsEnabled() ? 1 : 0));
+            }
+            if (destinations.size() == 2) {
+                // The source window holds only the preview's tab. When yours holds one tab too, the labels
+                // can't tell them apart: Dia lists the window last active (the preview's) first.
+                auto singleTab = [](const muxc::MenuFlyoutItem& item) {
+                    return std::wstring_view(item.Text()).ends_with(L" & 1 Tab");
+                };
+                bool firstIsSource = singleTab(destinations[0]), secondIsSource = singleTab(destinations[1]);
+                if (firstIsSource == secondIsSource) firstIsSource = true;
+                destinations.erase(destinations.begin() + (firstIsSource ? 0 : 1));
+            }
+            if (destinations.size() != 1 || !destinations.front().IsEnabled()) {
+                Log("peek: no single destination (%zu)", destinations.size());
+                return -1;
+            }
+            Log("peek: invoking Move to Window: %ls", destinations.front().Text().c_str());
+            Peek_BeforeMove();  // (a still picture covers the page while it changes windows)
+            ap::Peers::MenuFlyoutItemAutomationPeer(destinations.front()).Invoke();
+            return 1;
+        }
+    } catch (winrt::hresult_error const& e) {
+        Log("peek: tab menu error 0x%08lx", (unsigned long)e.code());
+        return -1;
+    } catch (...) {
+        return -1;
+    }
+    return 0;
+}
+

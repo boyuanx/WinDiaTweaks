@@ -161,6 +161,7 @@ static void LoadConfig() {
         if (line.rfind(L"section:", 0) == 0) { cur->section = Trim(line.substr(8)); continue; }
         if (line.rfind(L"icon:", 0) == 0) { cur->icon = Trim(line.substr(5)); continue; }
         if (line.rfind(L"value:", 0) == 0) { cur->value = Trim(line.substr(6)); continue; }
+        if (line.rfind(L"switch:", 0) == 0) { cur->noSwitch = Trim(line.substr(7)) == L"none"; continue; }
         if (line.rfind(L"choices:", 0) == 0) {
             std::wstringstream cs(line.substr(8));
             std::wstring part;
